@@ -1,0 +1,301 @@
+"""Host CLI adapters. This module never invokes a shell or copies credentials."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import signal
+import subprocess
+from pathlib import Path
+from typing import Literal
+
+from .contract import AgentEvent, AgentResult, AgentStatus, CodingTask, FailureClass
+
+
+_SECRET = re.compile(
+    r"(?i)(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|"
+    r"(?:api[_-]?key|access[_-]?token|authorization)\s*[:=]\s*[^\s,}\]]+)"
+)
+_MAX_TEXT = 4096
+_MAX_CAPTURE = 65536
+
+
+def _redact(value: str) -> str:
+    return _SECRET.sub("[REDACTED]", value)[:_MAX_TEXT]
+
+
+def _safe_event_type(item: object) -> str:
+    if not isinstance(item, dict):
+        return "unstructured"
+    event_type = item.get("type")
+    if isinstance(event_type, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", event_type):
+        return event_type
+    return "unknown"
+
+
+def _result_text(item: object) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    # Claude emits the final text in a result event. Codex emits agent message
+    # items. Other event fields are not copied into artifacts.
+    if item.get("type") == "result" and isinstance(item.get("result"), str):
+        return _redact(item["result"])
+    if item.get("type") == "item.completed":
+        nested = item.get("item")
+        if isinstance(nested, dict) and nested.get("type") == "agent_message":
+            text = nested.get("text")
+            if isinstance(text, str):
+                return _redact(text)
+    return None
+
+
+def _diagnostic_category(message: str) -> str | None:
+    lower = message.lower()
+    if any(term in lower for term in ("auth", "login", "credential", "401", "token expired")):
+        return "authentication"
+    if any(term in lower for term in ("network", "connection", "dns", "timed out")):
+        return "network"
+    return None
+
+
+async def _kill_tree(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    if os.name == "nt":
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(process.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(killer.wait(), timeout=5)
+        except (OSError, TimeoutError):
+            process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+class HostCliRuntime:
+    """One CLI process per run; no remote transport or persistent state."""
+
+    def __init__(
+        self,
+        provider: Literal["codex", "claude"],
+        *,
+        timeout_seconds: float = 120,
+        codex_sandbox: Literal["read-only", "workspace-write"] = "read-only",
+        claude_tools: tuple[str, ...] = (),
+    ) -> None:
+        if provider not in ("codex", "claude"):
+            raise ValueError("provider must be codex or claude")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if codex_sandbox not in ("read-only", "workspace-write"):
+            raise ValueError("unsupported Codex sandbox mode")
+        self.provider = provider
+        self.timeout_seconds = timeout_seconds
+        self.codex_sandbox = codex_sandbox
+        self.claude_tools = claude_tools
+        self._statuses: dict[str, AgentStatus] = {}
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._cancelled: set[str] = set()
+        self._lock = asyncio.Lock()
+
+    def command(self, workspace: Path) -> tuple[str, ...]:
+        if self.provider == "codex":
+            return (
+                "codex", "exec", "--json", "--ephemeral", "--sandbox", self.codex_sandbox,
+                "--cd", str(workspace), "-",
+            )
+        return (
+            "claude", "--print", "--verbose", "--output-format", "stream-json",
+            "--permission-mode", "dontAsk", "--permission-prompts", "none",
+            "--restricted", "--no-session-persistence", "--tools",
+            ",".join(self.claude_tools),
+        )
+
+    async def execute(
+        self, task: CodingTask, workspace: Path, session_id: str | None = None
+    ) -> AgentResult:
+        if task.provider != self.provider:
+            raise ValueError("task provider does not match runtime")
+        if session_id is not None:
+            raise ValueError("session resume is not verified for this adapter")
+        if not workspace.is_dir():
+            raise ValueError("workspace must be an existing directory")
+        workspace = workspace.resolve()
+        async with self._lock:
+            if task.run_id in self._statuses:
+                raise ValueError(f"run_id already used: {task.run_id}")
+            self._statuses[task.run_id] = AgentStatus.RUNNING
+
+        events = [AgentEvent(task.run_id, task.correlation_id, 1, "started", self.provider)]
+        final_text: str | None = None
+        stderr = ""
+        diagnostic_category: str | None = None
+        process: asyncio.subprocess.Process | None = None
+        failure_class: FailureClass | None = None
+        status = AgentStatus.FAILED
+        exit_code: int | None = None
+        try:
+            flags = {"start_new_session": True} if os.name != "nt" else {
+                "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP,
+            }
+            process = await asyncio.create_subprocess_exec(
+                *self.command(workspace), cwd=workspace,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **flags,
+            )
+            async with self._lock:
+                self._processes[task.run_id] = process
+                already_cancelled = task.run_id in self._cancelled
+            if already_cancelled:
+                await _kill_tree(process)
+            else:
+                # A prompt is sent via stdin, never placed in argv or a shell.
+                assert process.stdin is not None
+                process.stdin.write(task.prompt.encode("utf-8"))
+                await process.stdin.drain()
+                process.stdin.close()
+                await process.stdin.wait_closed()
+
+                async def read_stdout() -> None:
+                    nonlocal final_text, diagnostic_category
+                    assert process is not None and process.stdout is not None
+                    pending = bytearray()
+
+                    def accept_line(line: bytes) -> None:
+                        nonlocal final_text, diagnostic_category
+                        if len(events) >= 1000:
+                            return
+                        try:
+                            parsed = json.loads(line)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            kind = "unstructured"
+                        else:
+                            kind = _safe_event_type(parsed)
+                            candidate = _result_text(parsed)
+                            if candidate is not None:
+                                final_text = candidate
+                            if kind in ("error", "turn.failed") and isinstance(parsed, dict):
+                                detail = parsed.get("message", parsed.get("error"))
+                                if isinstance(detail, str):
+                                    diagnostic_category = _diagnostic_category(detail) or diagnostic_category
+                                elif isinstance(detail, dict) and isinstance(detail.get("message"), str):
+                                    diagnostic_category = _diagnostic_category(detail["message"]) or diagnostic_category
+                        events.append(AgentEvent(
+                            task.run_id, task.correlation_id, len(events) + 1, kind, kind,
+                        ))
+
+                    while chunk := await process.stdout.read(4096):
+                        pending.extend(chunk)
+                        if len(pending) > _MAX_CAPTURE and b"\n" not in pending:
+                            pending.clear()
+                            accept_line(b"")
+                        while newline := pending.find(b"\n") + 1:
+                            line = bytes(pending[:newline])
+                            del pending[:newline]
+                            if len(line) <= _MAX_CAPTURE:
+                                accept_line(line)
+                            else:
+                                accept_line(b"")
+                    if pending:
+                        accept_line(bytes(pending))
+
+                async def read_stderr() -> str:
+                    assert process is not None and process.stderr is not None
+                    data = bytearray()
+                    while chunk := await process.stderr.read(4096):
+                        data.extend(chunk)
+                        if len(data) > _MAX_CAPTURE:
+                            del data[:-_MAX_CAPTURE]
+                    return _redact(data.decode("utf-8", errors="replace"))
+
+                async with asyncio.timeout(self.timeout_seconds):
+                    _, stderr = await asyncio.gather(read_stdout(), read_stderr())
+                    exit_code = await process.wait()
+            async with self._lock:
+                was_cancelled = task.run_id in self._cancelled
+            if was_cancelled:
+                status = AgentStatus.CANCELLED
+            elif exit_code == 0:
+                status = AgentStatus.SUCCEEDED
+            else:
+                status = AgentStatus.FAILED
+                diagnostic_category = diagnostic_category or _diagnostic_category(stderr)
+                failure_class = (
+                    FailureClass.INFRASTRUCTURE
+                    if diagnostic_category in ("authentication", "network")
+                    else FailureClass.AGENT
+                )
+        except TimeoutError:
+            status = AgentStatus.TIMED_OUT
+            failure_class = FailureClass.TIMEOUT
+            if process is not None:
+                await _kill_tree(process)
+        except OSError as exc:
+            status = AgentStatus.FAILED
+            failure_class = FailureClass.INFRASTRUCTURE
+            stderr = _redact(str(exc))
+            diagnostic_category = _diagnostic_category(stderr)
+            if process is not None:
+                await _kill_tree(process)
+        except asyncio.CancelledError:
+            status = AgentStatus.CANCELLED
+            if process is not None:
+                await asyncio.shield(_kill_tree(process))
+            raise
+        finally:
+            async with self._lock:
+                self._processes.pop(task.run_id, None)
+                self._statuses[task.run_id] = status
+                self._cancelled.discard(task.run_id)
+
+        summary = f"{self.provider} CLI {status.value}"
+        events.append(AgentEvent(task.run_id, task.correlation_id, len(events) + 1, status.value, summary))
+        return AgentResult(
+            run_id=task.run_id, correlation_id=task.correlation_id,
+            status=status, summary=summary, events=tuple(events),
+            failure_class=failure_class, exit_code=exit_code,
+            output={"final_text": final_text, "stderr_tail": stderr,
+                    "diagnostic_category": diagnostic_category},
+        )
+
+    async def cancel(self, run_id: str) -> None:
+        async with self._lock:
+            if run_id not in self._statuses:
+                raise KeyError(run_id)
+            if self._statuses[run_id] != AgentStatus.RUNNING:
+                return
+            self._cancelled.add(run_id)
+            process = self._processes.get(run_id)
+        if process is not None:
+            await _kill_tree(process)
+
+    async def get_status(self, run_id: str) -> AgentStatus:
+        async with self._lock:
+            return self._statuses[run_id]
+
+
+class CodexRuntime(HostCliRuntime):
+    def __init__(self, *, timeout_seconds: float = 120,
+                 sandbox: Literal["read-only", "workspace-write"] = "read-only") -> None:
+        super().__init__("codex", timeout_seconds=timeout_seconds, codex_sandbox=sandbox)
+
+
+class ClaudeRuntime(HostCliRuntime):
+    def __init__(self, *, timeout_seconds: float = 120,
+                 tools: tuple[str, ...] = ()) -> None:
+        super().__init__("claude", timeout_seconds=timeout_seconds, claude_tools=tools)

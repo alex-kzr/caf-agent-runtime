@@ -9,6 +9,7 @@ from .contract import (
     FailureClass,
 )
 from .synthetic import SyntheticOutcome, SyntheticRuntime
+from .cli import ClaudeRuntime, CodexRuntime, HostCliRuntime
 
 __all__ = [
     "AgentEvent",
@@ -16,7 +17,10 @@ __all__ = [
     "AgentStatus",
     "CodingAgentRuntime",
     "CodingTask",
+    "ClaudeRuntime",
+    "CodexRuntime",
     "FailureClass",
+    "HostCliRuntime",
     "SyntheticOutcome",
     "SyntheticRuntime",
 ]

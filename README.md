@@ -1,9 +1,9 @@
 # CAF agent runtime
 
 This independently versioned package defines CAF's in-process coding-agent runtime
-boundary (`CodingTask`, `CodingAgentRuntime`, `AgentResult`) and a deterministic
-`SyntheticRuntime` for workflow tests. It implements no Codex or Claude CLI
-invocation yet. The synthetic adapter never edits the workspace, starts a process,
+boundary (`CodingTask`, `CodingAgentRuntime`, `AgentResult`), a deterministic
+`SyntheticRuntime` for workflow tests, and host `CodexRuntime`/`ClaudeRuntime`
+adapters. The synthetic adapter never edits the workspace, starts a process,
 or produces a real commit. See the umbrella `SPEC.md` §9 and
 `docs/architecture/contracts.md` for the intended full boundary.
 
@@ -14,6 +14,15 @@ Requires Python 3.12+ and uv:
 ```sh
 uv sync --group dev
 uv run pytest
+```
+
+The opt-in CLI smoke runner creates and removes a disposable Git worktree under
+the system temporary directory. It sends a fixed no-tools prompt and prints only
+status, event kinds, and diagnostic categories:
+
+```sh
+uv run python scripts/smoke.py codex
+uv run python scripts/smoke.py claude
 ```
 
 The package can be installed in another local CAF service with a versioned Git
@@ -61,7 +70,31 @@ assert result.output["approved"] is True
 
 ## Pending work
 
-Real CLI adapters need verified argument arrays, process-tree cancellation,
-timeouts, event parsing, redaction, workspace and credential handling, and
-integration tests on the installed CLI versions. No production security or
-session-resume claim follows from this synthetic implementation.
+The host adapters pass argument arrays to `asyncio.create_subprocess_exec`, send
+the prompt over stdin, set an explicit working directory, enforce a wall-time
+limit, and kill a process tree on timeout or cancellation. Codex defaults to
+`read-only` sandbox; `workspace-write` requires explicit construction. Claude
+defaults to restricted mode with no tools and denied permission prompts; tool
+allowlists require explicit construction. Structured stdout events contribute
+only event types and redacted final text; stderr is bounded and redacted by a
+best-effort token pattern. Authentication and network errors detected in output
+are infrastructure failures, other nonzero exits are agent failures. No CLI
+authentication material is copied into the runtime.
+
+**Verified locally on 2026-10-13:** `codex-cli 0.162.1` help lists `exec`,
+`--json`, `--ephemeral`, `--sandbox`, and `--cd`. `Claude Code 2.1.296` help
+lists `--print`, `--verbose`, `--output-format stream-json`, `--restricted`,
+`--permission-mode dontAsk`, `--permission-prompts none`, and
+`--no-session-persistence`. A no-tools Claude call using the existing Pro login
+exited 0, emitted `system`, `assistant`, `rate_limit_event`, and `result` events,
+and returned the expected marker. A read-only Codex smoke call exited 1 with
+`error` and `turn.failed` events and an authentication-related diagnostic,
+despite `codex login status` reporting a ChatGPT login. No credential changes
+were made. This does not verify successful Codex task execution.
+
+**Still pending:** Confirm Codex execution with the existing profile; verify
+write-capable CLI paths and actual file changes in an isolated worktree;
+structured session IDs and resume; provider-specific event/usage extraction;
+full secret redaction; process-tree cleanup on each supported host; and
+integration with workspace allocation, durable events and recovery. Worktrees
+provide Git isolation, not a security sandbox.
