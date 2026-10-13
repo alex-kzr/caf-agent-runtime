@@ -96,6 +96,18 @@ and returned the expected marker. A read-only Codex smoke call exited 1 with
 despite `codex login status` reporting a ChatGPT login. No credential changes
 were made. This does not verify successful Codex task execution.
 
+**Executable resolution finding:** PowerShell's `codex` command above selected
+the npm 0.162.1 wrapper, but Python `subprocess.run(['codex', '--version'])`,
+which matches this adapter's launch method, returned **0.147.0**. That version
+matches the separate desktop Codex executable in the same Windows user's local
+programs directory. Both installations reported a ChatGPT login, and the
+0.147.0 `exec --help` lists the adapter's flags. The original smoke retained
+only an authentication *category*, not the exact provider error. The executable
+mismatch must be resolved and a new isolated smoke run approved before claiming
+which Codex installation can execute tasks. The observed mismatch does not by
+itself prove the authentication failure's cause. See the umbrella
+`docs/development/environment.md` for path and user metadata.
+
 **Still pending:** Confirm Codex execution with the existing profile; verify
 write-capable CLI paths and actual file changes in an isolated worktree;
 structured session IDs and resume; provider-specific event/usage extraction;
