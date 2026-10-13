@@ -21,6 +21,49 @@ def test_contract_rejects_invalid_tasks_and_results() -> None:
         SyntheticOutcome(status=AgentStatus.TIMED_OUT)
 
 
+@pytest.mark.parametrize("status, failure_class", [
+    (AgentStatus.RUNNING, None),
+    (AgentStatus.SUCCEEDED, FailureClass.AGENT),
+    (AgentStatus.CANCELLED, FailureClass.INFRASTRUCTURE),
+    (AgentStatus.TIMED_OUT, None),
+    (AgentStatus.TIMED_OUT, FailureClass.AGENT),
+    (AgentStatus.FAILED, None),
+    (AgentStatus.FAILED, FailureClass.TIMEOUT),
+])
+def test_result_rejects_inconsistent_terminal_state(
+    status: AgentStatus, failure_class: FailureClass | None
+) -> None:
+    with pytest.raises(ValueError):
+        AgentResult("r", "c", status, "summary", (), failure_class=failure_class)
+
+
+@pytest.mark.parametrize("status, failure_class", [
+    (AgentStatus.SUCCEEDED, None),
+    (AgentStatus.CANCELLED, None),
+    (AgentStatus.TIMED_OUT, FailureClass.TIMEOUT),
+    (AgentStatus.FAILED, FailureClass.AGENT),
+    (AgentStatus.FAILED, FailureClass.INFRASTRUCTURE),
+    (AgentStatus.FAILED, FailureClass.QUALITY_GATE),
+])
+def test_result_accepts_consistent_terminal_state(
+    status: AgentStatus, failure_class: FailureClass | None
+) -> None:
+    result = AgentResult("r", "c", status, "summary", (), failure_class=failure_class)
+    assert result.status == status
+
+
+@pytest.mark.parametrize("status, failure_class", [
+    (AgentStatus.SUCCEEDED, FailureClass.AGENT),
+    (AgentStatus.TIMED_OUT, FailureClass.INFRASTRUCTURE),
+    (AgentStatus.FAILED, FailureClass.TIMEOUT),
+])
+def test_synthetic_outcome_uses_same_failure_rules(
+    status: AgentStatus, failure_class: FailureClass
+) -> None:
+    with pytest.raises(ValueError):
+        SyntheticOutcome(status=status, failure_class=failure_class)
+
+
 @pytest.mark.asyncio
 async def test_scripted_review_sequence_and_correlation(tmp_path: Path) -> None:
     runtime = SyntheticRuntime({"review": [

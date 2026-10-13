@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .contract import AgentEvent, AgentResult, AgentStatus, CodingTask, FailureClass
+from .contract import (
+    AgentEvent, AgentResult, AgentStatus, CodingTask, FailureClass,
+    _validate_terminal_failure,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,12 +27,7 @@ class SyntheticOutcome:
             raise ValueError("delay_seconds must be nonnegative")
         if self.status not in (AgentStatus.SUCCEEDED, AgentStatus.FAILED, AgentStatus.TIMED_OUT):
             raise ValueError("synthetic outcomes must be success, failure, or timeout")
-        if self.status == AgentStatus.SUCCEEDED and self.failure_class is not None:
-            raise ValueError("successful outcome cannot have a failure class")
-        if self.status == AgentStatus.FAILED and self.failure_class is None:
-            raise ValueError("failed outcome requires a failure class")
-        if self.status == AgentStatus.TIMED_OUT and self.failure_class != FailureClass.TIMEOUT:
-            raise ValueError("timed out outcome requires timeout failure class")
+        _validate_terminal_failure(self.status, self.failure_class)
 
 
 class SyntheticRuntime:

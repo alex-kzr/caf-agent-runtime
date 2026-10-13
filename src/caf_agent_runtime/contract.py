@@ -23,6 +23,21 @@ class FailureClass(StrEnum):
     QUALITY_GATE = "quality_gate"
 
 
+def _validate_terminal_failure(status: AgentStatus, failure_class: FailureClass | None) -> None:
+    """Keep result and synthetic-outcome terminal semantics aligned."""
+    if status == AgentStatus.RUNNING:
+        raise ValueError("running is not a terminal result")
+    if status in (AgentStatus.SUCCEEDED, AgentStatus.CANCELLED):
+        if failure_class is not None:
+            raise ValueError(f"{status.value} result cannot have a failure class")
+    elif status == AgentStatus.TIMED_OUT:
+        if failure_class != FailureClass.TIMEOUT:
+            raise ValueError("timed out result requires timeout failure class")
+    elif status == AgentStatus.FAILED:
+        if failure_class is None or failure_class == FailureClass.TIMEOUT:
+            raise ValueError("failed result requires a non-timeout failure class")
+
+
 @dataclass(frozen=True, slots=True)
 class CodingTask:
     run_id: str
@@ -62,12 +77,7 @@ class AgentResult:
     usage: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
-        if self.status == AgentStatus.SUCCEEDED and self.failure_class is not None:
-            raise ValueError("successful result cannot have a failure class")
-        if self.status in (AgentStatus.FAILED, AgentStatus.TIMED_OUT) and self.failure_class is None:
-            raise ValueError("failed or timed out result requires a failure class")
-        if self.status == AgentStatus.RUNNING:
-            raise ValueError("running is not a terminal result")
+        _validate_terminal_failure(self.status, self.failure_class)
 
 
 class CodingAgentRuntime(Protocol):

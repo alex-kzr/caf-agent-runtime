@@ -39,7 +39,9 @@ agent, infrastructure, timeout, and quality-gate outcomes. Caller cancellation
 is propagated as `asyncio.CancelledError`; `cancel(run_id)` instead causes a
 terminal `cancelled` result. Synthetic state is in memory and cannot recover
 after a restart. Synthetic outcomes have no CLI exit code unless a test
-explicitly scripts one.
+explicitly scripts one. A `timed_out` result requires the `timeout` failure
+class; `failed` requires another failure class; `succeeded` and `cancelled`
+cannot carry a failure class.
 
 ## Example
 
