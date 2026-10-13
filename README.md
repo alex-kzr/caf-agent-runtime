@@ -89,9 +89,22 @@ The host adapters pass argument arrays to `asyncio.create_subprocess_exec`, send
 the prompt over stdin, set an explicit working directory, and enforce a wall-time
 limit across process launch and concurrent stdin/stdout/stderr handling. On timeout
 or cancellation they attempt process-tree cleanup even if the direct CLI process
-has already exited. POSIX uses a dedicated process group; Windows uses
-`taskkill /T /F`, which may not find descendants after the parent exits. Windows
-orphan cleanup is therefore not yet guaranteed. A live Windows test verified that cancelling a still-running Python parent through this adapter also terminated its spawned child. A separate disposable probe observed the opposite case: after the parent exited and a child retained a pipe, the adapter returned `timed_out` while that child remained alive. The probe then forcibly terminated and verified removal of its own child. The PID-based `taskkill` path cannot find that orphan reliably. Do not connect this adapter to automatic shared-queue dispatch until that case has a verified cleanup or quarantine mechanism. Codex defaults to
+has already exited. POSIX uses a dedicated process group. On Windows, a gated
+supervisor waits until it is assigned to a fresh unnamed Job Object before
+starting the CLI. Its descendants inherit that Job; timeout and cancellation
+terminate the Job and verify its active-process count is zero. A CLI exit code
+of zero with a live descendant is reported as an infrastructure failure before
+the descendant is stopped. A failure to verify cleanup raises
+`ProcessTreeCleanupError`; a queue executor must leave that claim unacknowledged
+for orphan quarantine. Live Windows tests covered a parent that exits while
+its detached child retains output pipes, a detached child with closed pipes,
+cancellation after the parent exits, normal completion, and preservation of an
+unrelated process. These tests use local Python processes, not Codex or Claude.
+The previous PID-based `taskkill` cleanup failed for an orphan in a disposable
+probe and is retained only as a fallback outside the Windows Job path. This
+does not establish safety for processes that explicitly break away from the
+Job or for a crashed host worker; keep shared queue CLI dispatch disabled until
+those boundaries are addressed. Codex defaults to
 `read-only` sandbox; `workspace-write` requires explicit construction. Claude
 defaults to restricted mode with no tools and denied permission prompts; tool
 allowlists require explicit construction. Structured stdout events contribute

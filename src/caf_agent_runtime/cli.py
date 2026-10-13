@@ -8,10 +8,15 @@ import os
 import re
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Literal
 
 from .contract import AgentEvent, AgentResult, AgentStatus, CodingTask, FailureClass
+from .windows_job import ProcessTreeCleanupError, WindowsJob
+
+
+_WINDOWS_JOB_ENABLED = os.name == "nt"
 
 
 _SECRET = re.compile(
@@ -137,6 +142,7 @@ class HostCliRuntime:
         self.claude_tools = claude_tools
         self._statuses: dict[str, AgentStatus] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._jobs: dict[str, WindowsJob] = {}
         self._cancelled: set[str] = set()
         self._lock = asyncio.Lock()
 
@@ -175,6 +181,7 @@ class HostCliRuntime:
         diagnostic_category: str | None = None
         diagnostic_detail: str | None = None
         process: asyncio.subprocess.Process | None = None
+        job: WindowsJob | None = None
         failure_class: FailureClass | None = None
         status = AgentStatus.FAILED
         exit_code: int | None = None
@@ -183,20 +190,42 @@ class HostCliRuntime:
             flags = {"start_new_session": True} if os.name != "nt" else {
                 "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP,
             }
+            command = self.command(workspace)
+            if _WINDOWS_JOB_ENABLED:
+                job = WindowsJob()
+                command = (sys.executable, "-m", "caf_agent_runtime._windows_supervisor", *command)
             async with asyncio.timeout_at(deadline):
                 process = await asyncio.create_subprocess_exec(
-                    *self.command(workspace), cwd=workspace,
+                    *command, cwd=workspace,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     **flags,
                 )
+            if job is not None:
+                try:
+                    job.assign(process.pid)
+                except ProcessTreeCleanupError:
+                    # The gated supervisor has not seen GO and has no child.
+                    # Kill only this held process handle if assignment fails.
+                    process.kill()
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                    raise
             async with self._lock:
                 self._processes[task.run_id] = process
+                if job is not None:
+                    self._jobs[task.run_id] = job
                 already_cancelled = task.run_id in self._cancelled
             if already_cancelled:
-                await _kill_tree(process)
+                if job is not None:
+                    job.terminate_and_verify()
+                else:
+                    await _kill_tree(process)
             else:
+                if job is not None:
+                    assert process.stdin is not None
+                    process.stdin.write(b"\x02")
+                    await process.stdin.drain()
                 # A prompt is sent via stdin, never placed in argv or a shell.
                 async def read_stdout() -> None:
                     nonlocal final_text, diagnostic_category, diagnostic_detail
@@ -291,7 +320,7 @@ class HostCliRuntime:
         except TimeoutError:
             status = AgentStatus.TIMED_OUT
             failure_class = FailureClass.TIMEOUT
-            if process is not None:
+            if process is not None and job is None:
                 await _kill_tree(process)
         except OSError as exc:
             async with self._lock:
@@ -301,18 +330,40 @@ class HostCliRuntime:
             stderr = "" if was_cancelled else _redact(str(exc))
             diagnostic_category = _diagnostic_category(stderr)
             diagnostic_detail = None if was_cancelled else _safe_diagnostic_detail(stderr)
-            if process is not None:
+            if process is not None and job is None:
                 await _kill_tree(process)
         except asyncio.CancelledError:
             status = AgentStatus.CANCELLED
-            if process is not None:
+            if process is not None and job is None:
                 await asyncio.shield(_kill_tree(process))
             raise
         finally:
+            cleanup_error: ProcessTreeCleanupError | None = None
+            if job is not None:
+                try:
+                    if status == AgentStatus.SUCCEEDED and job.active_processes():
+                        # Supervisor exited, but a detached task process is
+                        # still running. Killing it is not a clean success.
+                        status = AgentStatus.FAILED
+                        failure_class = FailureClass.INFRASTRUCTURE
+                        diagnostic_category = "orphan_process"
+                        diagnostic_detail = "task process survived CLI exit"
+                    job.terminate_and_verify()
+                except ProcessTreeCleanupError as exc:
+                    cleanup_error = exc
+                try:
+                    job.close()
+                except ProcessTreeCleanupError as exc:
+                    cleanup_error = exc
+                if cleanup_error is not None:
+                    status = AgentStatus.FAILED
             async with self._lock:
                 self._processes.pop(task.run_id, None)
+                self._jobs.pop(task.run_id, None)
                 self._statuses[task.run_id] = status
                 self._cancelled.discard(task.run_id)
+            if cleanup_error is not None:
+                raise cleanup_error
 
         summary = f"{self.provider} CLI {status.value}"
         events.append(AgentEvent(task.run_id, task.correlation_id, len(events) + 1, status.value, summary))
@@ -333,8 +384,13 @@ class HostCliRuntime:
                 return
             self._cancelled.add(run_id)
             process = self._processes.get(run_id)
+            job = self._jobs.get(run_id)
         if process is not None:
-            await _kill_tree(process)
+            if job is not None:
+                job.terminate_and_verify()
+                await asyncio.wait_for(process.wait(), timeout=5)
+            else:
+                await _kill_tree(process)
 
     async def get_status(self, run_id: str) -> AgentStatus:
         async with self._lock:

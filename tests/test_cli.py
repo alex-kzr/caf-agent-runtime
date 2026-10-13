@@ -11,6 +11,14 @@ from caf_agent_runtime import (
     AgentStatus, ClaudeRuntime, CodexRuntime, CodingTask, FailureClass,
 )
 from caf_agent_runtime import cli
+from caf_agent_runtime.windows_job import ProcessTreeCleanupError
+
+
+@pytest.fixture(autouse=True)
+def mocked_process_tests_bypass_windows_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This module injects FakeProcess objects instead of OS processes. Live Job
+    # Object behavior is exercised in test_windows_job_live.py.
+    monkeypatch.setattr(cli, "_WINDOWS_JOB_ENABLED", False)
 
 
 class FakeStdin:
@@ -52,12 +60,14 @@ class FakeProcess:
         self.stderr = FakeStream(stderr)
         self.returncode: int | None = None
         self.exit_code = exit_code
+        self.killed = False
 
     async def wait(self) -> int:
         self.returncode = self.exit_code
         return self.exit_code
 
     def kill(self) -> None:
+        self.killed = True
         self.returncode = -9
 
 
@@ -210,6 +220,8 @@ async def test_stalled_stdin_is_bounded_by_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     fake = FakeProcess(b"")
+    killed = []
+    fake.kill = lambda: killed.append(True)  # type: ignore[method-assign]
     blocker = asyncio.Event()
 
     async def blocked_drain() -> None:
@@ -297,3 +309,53 @@ async def test_kill_tree_attempted_after_parent_exits(monkeypatch: pytest.Monkey
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", spawn)
     await cli._kill_tree(parent)
     assert spawn.await_args.args[:4] == ("taskkill", "/PID", str(parent.pid), "/T")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object failure path")
+async def test_unverified_job_cleanup_is_visible_failure(monkeypatch: pytest.MonkeyPatch,
+                                                         tmp_path: Path) -> None:
+    class FailingJob:
+        def assign(self, pid: int) -> None:
+            pass
+
+        def active_processes(self) -> int:
+            return 0
+
+        def terminate_and_verify(self) -> None:
+            raise ProcessTreeCleanupError("synthetic cleanup failure")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "_WINDOWS_JOB_ENABLED", True)
+    monkeypatch.setattr(cli, "WindowsJob", FailingJob)
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec",
+                        AsyncMock(return_value=FakeProcess(b"")))
+    runtime = codex_runtime()
+    with pytest.raises(ProcessTreeCleanupError, match="cleanup failure"):
+        await runtime.execute(task("codex"), tmp_path)
+    assert await runtime.get_status("run-1") == AgentStatus.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object assignment path")
+async def test_failed_job_assignment_kills_gated_supervisor(monkeypatch: pytest.MonkeyPatch,
+                                                            tmp_path: Path) -> None:
+    class RejectingJob:
+        def assign(self, pid: int) -> None:
+            raise ProcessTreeCleanupError("assignment refused")
+
+        def terminate_and_verify(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    fake = FakeProcess(b"")
+    monkeypatch.setattr(cli, "_WINDOWS_JOB_ENABLED", True)
+    monkeypatch.setattr(cli, "WindowsJob", RejectingJob)
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
+    with pytest.raises(ProcessTreeCleanupError, match="assignment refused"):
+        await codex_runtime().execute(task("codex"), tmp_path)
+    assert fake.killed
