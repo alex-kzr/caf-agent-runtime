@@ -71,8 +71,12 @@ assert result.output["approved"] is True
 ## Pending work
 
 The host adapters pass argument arrays to `asyncio.create_subprocess_exec`, send
-the prompt over stdin, set an explicit working directory, enforce a wall-time
-limit, and kill a process tree on timeout or cancellation. Codex defaults to
+the prompt over stdin, set an explicit working directory, and enforce a wall-time
+limit across process launch and concurrent stdin/stdout/stderr handling. On timeout
+or cancellation they attempt process-tree cleanup even if the direct CLI process
+has already exited. POSIX uses a dedicated process group; Windows uses
+`taskkill /T /F`, which may not find descendants after the parent exits. Windows
+orphan cleanup is therefore not yet guaranteed or empirically verified. Codex defaults to
 `read-only` sandbox; `workspace-write` requires explicit construction. Claude
 defaults to restricted mode with no tools and denied permission prompts; tool
 allowlists require explicit construction. Structured stdout events contribute

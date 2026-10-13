@@ -61,8 +61,8 @@ def _diagnostic_category(message: str) -> str | None:
 
 
 async def _kill_tree(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
+    # Descendants may still own stdout/stderr after the direct CLI has exited.
+    # Attempt tree cleanup even when its return code is already available.
     if os.name == "nt":
         try:
             killer = await asyncio.create_subprocess_exec(
@@ -72,7 +72,8 @@ async def _kill_tree(process: asyncio.subprocess.Process) -> None:
             )
             await asyncio.wait_for(killer.wait(), timeout=5)
         except (OSError, TimeoutError):
-            process.kill()
+            if process.returncode is None:
+                process.kill()
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -81,7 +82,8 @@ async def _kill_tree(process: asyncio.subprocess.Process) -> None:
     try:
         await asyncio.wait_for(process.wait(), timeout=5)
     except TimeoutError:
-        process.kill()
+        if process.returncode is None:
+            process.kill()
         await process.wait()
 
 
@@ -147,17 +149,19 @@ class HostCliRuntime:
         failure_class: FailureClass | None = None
         status = AgentStatus.FAILED
         exit_code: int | None = None
+        deadline = asyncio.get_running_loop().time() + self.timeout_seconds
         try:
             flags = {"start_new_session": True} if os.name != "nt" else {
                 "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP,
             }
-            process = await asyncio.create_subprocess_exec(
-                *self.command(workspace), cwd=workspace,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **flags,
-            )
+            async with asyncio.timeout_at(deadline):
+                process = await asyncio.create_subprocess_exec(
+                    *self.command(workspace), cwd=workspace,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    **flags,
+                )
             async with self._lock:
                 self._processes[task.run_id] = process
                 already_cancelled = task.run_id in self._cancelled
@@ -165,12 +169,6 @@ class HostCliRuntime:
                 await _kill_tree(process)
             else:
                 # A prompt is sent via stdin, never placed in argv or a shell.
-                assert process.stdin is not None
-                process.stdin.write(task.prompt.encode("utf-8"))
-                await process.stdin.drain()
-                process.stdin.close()
-                await process.stdin.wait_closed()
-
                 async def read_stdout() -> None:
                     nonlocal final_text, diagnostic_category
                     assert process is not None and process.stdout is not None
@@ -178,8 +176,6 @@ class HostCliRuntime:
 
                     def accept_line(line: bytes) -> None:
                         nonlocal final_text, diagnostic_category
-                        if len(events) >= 1000:
-                            return
                         try:
                             parsed = json.loads(line)
                         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -195,9 +191,10 @@ class HostCliRuntime:
                                     diagnostic_category = _diagnostic_category(detail) or diagnostic_category
                                 elif isinstance(detail, dict) and isinstance(detail.get("message"), str):
                                     diagnostic_category = _diagnostic_category(detail["message"]) or diagnostic_category
-                        events.append(AgentEvent(
-                            task.run_id, task.correlation_id, len(events) + 1, kind, kind,
-                        ))
+                        if len(events) < 1000:
+                            events.append(AgentEvent(
+                                task.run_id, task.correlation_id, len(events) + 1, kind, kind,
+                            ))
 
                     while chunk := await process.stdout.read(4096):
                         pending.extend(chunk)
@@ -223,9 +220,27 @@ class HostCliRuntime:
                             del data[:-_MAX_CAPTURE]
                     return _redact(data.decode("utf-8", errors="replace"))
 
-                async with asyncio.timeout(self.timeout_seconds):
-                    _, stderr = await asyncio.gather(read_stdout(), read_stderr())
-                    exit_code = await process.wait()
+                async def write_stdin() -> None:
+                    assert process is not None and process.stdin is not None
+                    process.stdin.write(task.prompt.encode("utf-8"))
+                    await process.stdin.drain()
+                    process.stdin.close()
+                    await process.stdin.wait_closed()
+
+                operations = [
+                    asyncio.create_task(write_stdin()),
+                    asyncio.create_task(read_stdout()),
+                    asyncio.create_task(read_stderr()),
+                    asyncio.create_task(process.wait()),
+                ]
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        _, _, stderr, exit_code = await asyncio.gather(*operations)
+                finally:
+                    for operation in operations:
+                        if not operation.done():
+                            operation.cancel()
+                    await asyncio.gather(*operations, return_exceptions=True)
             async with self._lock:
                 was_cancelled = task.run_id in self._cancelled
             if was_cancelled:
@@ -246,9 +261,11 @@ class HostCliRuntime:
             if process is not None:
                 await _kill_tree(process)
         except OSError as exc:
-            status = AgentStatus.FAILED
-            failure_class = FailureClass.INFRASTRUCTURE
-            stderr = _redact(str(exc))
+            async with self._lock:
+                was_cancelled = task.run_id in self._cancelled
+            status = AgentStatus.CANCELLED if was_cancelled else AgentStatus.FAILED
+            failure_class = None if was_cancelled else FailureClass.INFRASTRUCTURE
+            stderr = "" if was_cancelled else _redact(str(exc))
             diagnostic_category = _diagnostic_category(stderr)
             if process is not None:
                 await _kill_tree(process)

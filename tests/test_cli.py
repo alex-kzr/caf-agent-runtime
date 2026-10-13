@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -163,3 +164,97 @@ async def test_timeout_and_cancel(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     cancelled = await pending
     assert cancelled.status == AgentStatus.CANCELLED
     killed.assert_awaited_once_with(fake)
+
+
+@pytest.mark.asyncio
+async def test_stalled_stdin_is_bounded_by_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = FakeProcess(b"")
+    blocker = asyncio.Event()
+
+    async def blocked_drain() -> None:
+        await blocker.wait()
+
+    fake.stdin.drain = blocked_drain  # type: ignore[method-assign]
+    killed = AsyncMock()
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
+    monkeypatch.setattr(cli, "_kill_tree", killed)
+    result = await asyncio.wait_for(CodexRuntime(timeout_seconds=0.01).execute(task("codex"), tmp_path), 1)
+    assert result.status == AgentStatus.TIMED_OUT
+    killed.assert_awaited_once_with(fake)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_broken_pipe_stays_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = FakeProcess(b"")
+    started = asyncio.Event()
+    released = asyncio.Event()
+
+    async def broken_after_cancel() -> None:
+        started.set()
+        await released.wait()
+        raise BrokenPipeError("stdin closed")
+
+    async def kill(process: FakeProcess) -> None:
+        released.set()
+
+    fake.stdin.drain = broken_after_cancel  # type: ignore[method-assign]
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
+    monkeypatch.setattr(cli, "_kill_tree", kill)
+    runtime = CodexRuntime()
+    pending = asyncio.create_task(runtime.execute(task("codex"), tmp_path))
+    await started.wait()
+    await runtime.cancel("run-1")
+    result = await asyncio.wait_for(pending, 1)
+    assert result.status == AgentStatus.CANCELLED
+    assert result.failure_class is None
+
+
+@pytest.mark.asyncio
+async def test_parent_exited_but_inherited_pipe_times_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = FakeProcess(b"")
+    fake.returncode = 0
+    blocked = asyncio.Event()
+
+    async def inherited_pipe(size: int) -> bytes:
+        await blocked.wait()
+        return b""
+
+    fake.stdout.read = inherited_pipe  # type: ignore[method-assign]
+    killed = AsyncMock()
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
+    monkeypatch.setattr(cli, "_kill_tree", killed)
+    result = await asyncio.wait_for(CodexRuntime(timeout_seconds=0.01).execute(task("codex"), tmp_path), 1)
+    assert result.status == AgentStatus.TIMED_OUT
+    killed.assert_awaited_once_with(fake)
+
+
+@pytest.mark.asyncio
+async def test_terminal_result_parsed_after_event_retention_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lines = [json.dumps({"type": "item.started"}) for _ in range(1005)]
+    lines.append(json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message", "text": "late final text"}}))
+    fake = FakeProcess(("\n".join(lines) + "\n").encode())
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
+    result = await CodexRuntime().execute(task("codex"), tmp_path)
+    assert result.output["final_text"] == "late final text"
+    assert len(result.events) == 1001  # 1 start, 999 stream events, 1 terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows taskkill path")
+async def test_kill_tree_attempted_after_parent_exits(monkeypatch: pytest.MonkeyPatch) -> None:
+    parent = FakeProcess(b"")
+    parent.returncode = 0
+    killer = FakeProcess(b"")
+    spawn = AsyncMock(return_value=killer)
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", spawn)
+    await cli._kill_tree(parent)
+    assert spawn.await_args.args[:4] == ("taskkill", "/PID", str(parent.pid), "/T")
