@@ -118,6 +118,16 @@ best-effort token pattern. Authentication and network errors detected in output
 are infrastructure failures, other nonzero exits are agent failures. No CLI
 authentication material is copied into the runtime.
 
+Every CLI child now receives an explicit minimal environment: OS executable
+lookup and user profile/config directory paths, plus `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR` if set. It does not inherit `CAF_WORKER_TOKEN`, database
+credentials or model API keys from its parent. Windows Job Object supervisor
+children inherit this already filtered environment. A native child test with
+dummy secret variables verified their absence. This path-based setup has not
+been revalidated with a real provider CLI after the environment change; a
+provider requiring additional environment variables must be reviewed and
+added explicitly rather than restoring full inheritance.
+
 **Verified locally on 2026-10-13:** `codex-cli 0.162.1` help lists `exec`,
 `--json`, `--ephemeral`, `--sandbox`, and `--cd`. `Claude Code 2.1.296` help
 lists `--print`, `--verbose`, `--output-format stream-json`, `--restricted`,

@@ -12,6 +12,28 @@ import pytest
 from caf_agent_runtime import AgentStatus, CodexRuntime, CodingTask
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows native child environment proof")
+@pytest.mark.asyncio
+async def test_cli_child_does_not_inherit_worker_or_model_tokens(tmp_path: Path,
+                                                                 monkeypatch) -> None:
+    script = tmp_path / "inspect_env.py"
+    script.write_text(
+        "import json,os\n"
+        "names=('CAF_WORKER_TOKEN','CAF_API_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY')\n"
+        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message',"
+        "'text':json.dumps({name:name in os.environ for name in names})}}))\n",
+        encoding="utf-8",
+    )
+    for name in ("CAF_WORKER_TOKEN", "CAF_API_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.setenv(name, "dummy-test-value")
+    runtime = CodexRuntime(executable=Path(sys.executable), timeout_seconds=15)
+    runtime.command = lambda _: (sys.executable, str(script))  # type: ignore[method-assign]
+    result = await runtime.execute(CodingTask("env-run", "env-corr", "No coding", "codex"), tmp_path)
+    assert result.status == AgentStatus.SUCCEEDED
+    import json
+    assert not any(json.loads(result.output["final_text"]).values())
+
+
 def _alive(pid: int) -> bool:
     kernel = ctypes.windll.kernel32
     handle = kernel.OpenProcess(0x1000, False, pid)

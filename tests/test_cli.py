@@ -11,6 +11,7 @@ from caf_agent_runtime import (
     AgentStatus, ClaudeRuntime, CodexRuntime, CodingTask, FailureClass,
 )
 from caf_agent_runtime import cli
+from caf_agent_runtime import child_environment
 from caf_agent_runtime.windows_job import ProcessTreeCleanupError
 
 
@@ -79,6 +80,20 @@ def codex_runtime(**kwargs: object) -> CodexRuntime:
     return CodexRuntime(executable=Path(sys.executable), **kwargs)
 
 
+def test_child_environment_excludes_transport_and_model_credentials() -> None:
+    source = {"Path": "C:/bin", "USERPROFILE": "C:/Users/test",
+              "CODEX_HOME": "C:/Users/test/.codex",
+              "CLAUDE_CONFIG_DIR": "C:/Users/test/.claude",
+              "CAF_WORKER_TOKEN": "worker-secret", "CAF_API_TOKEN": "api-secret",
+              "OPENAI_API_KEY": "model-secret", "ANTHROPIC_API_KEY": "model-secret",
+              "CAF_QUEUE_TEST_DATABASE_URL": "db-secret", "UNRELATED": "hidden"}
+    assert child_environment(source) == {
+        "Path": "C:/bin", "USERPROFILE": "C:/Users/test",
+        "CODEX_HOME": "C:/Users/test/.codex",
+        "CLAUDE_CONFIG_DIR": "C:/Users/test/.claude",
+    }
+
+
 def test_codex_requires_an_explicit_existing_absolute_executable(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         CodexRuntime()  # type: ignore[call-arg]
@@ -126,6 +141,7 @@ async def test_argument_array_stdin_and_redacted_events(
     assert "Sensitive task prompt" not in args
     assert kwargs["cwd"] == tmp_path.resolve()
     assert "shell" not in kwargs
+    assert "env" in kwargs and "CAF_WORKER_TOKEN" not in kwargs["env"]
     if provider == "codex":
         assert "read-only" in args and "--json" in args
         assert args[0] == str(Path(sys.executable).resolve())

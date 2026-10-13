@@ -9,7 +9,7 @@ from .contract import (
     FailureClass,
 )
 from .synthetic import SyntheticOutcome, SyntheticRuntime
-from .cli import ClaudeRuntime, CodexRuntime, HostCliRuntime
+from .cli import ClaudeRuntime, CodexRuntime, HostCliRuntime, child_environment
 
 __all__ = [
     "AgentEvent",
@@ -19,6 +19,7 @@ __all__ = [
     "CodingTask",
     "ClaudeRuntime",
     "CodexRuntime",
+    "child_environment",
     "FailureClass",
     "HostCliRuntime",
     "SyntheticOutcome",

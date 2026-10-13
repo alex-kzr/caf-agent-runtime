@@ -19,6 +19,20 @@ from .windows_job import ProcessTreeCleanupError, WindowsJob
 _WINDOWS_JOB_ENABLED = os.name == "nt"
 
 
+_CHILD_ENV_KEYS = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
+    "USERPROFILE", "HOME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+    "PYTHONIOENCODING", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+})
+
+
+def child_environment(source: dict[str, str] | None = None) -> dict[str, str]:
+    """Pass OS lookup and CLI config paths, never the worker or model secrets."""
+    source = os.environ if source is None else source
+    return {key: value for key, value in source.items()
+            if key.upper() in _CHILD_ENV_KEYS and value}
+
+
 _SECRET = re.compile(
     r"(?i)(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|"
     r"(?:api[_-]?key|access[_-]?token|authorization)\s*[:=]\s*[^\s,}\]]+)"
@@ -91,6 +105,7 @@ async def _kill_tree(process: asyncio.subprocess.Process) -> None:
         try:
             killer = await asyncio.create_subprocess_exec(
                 "taskkill", "/PID", str(process.pid), "/T", "/F",
+                env=child_environment(),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -197,6 +212,7 @@ class HostCliRuntime:
             async with asyncio.timeout_at(deadline):
                 process = await asyncio.create_subprocess_exec(
                     *command, cwd=workspace,
+                    env=child_environment(),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
