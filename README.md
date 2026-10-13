@@ -91,7 +91,7 @@ limit across process launch and concurrent stdin/stdout/stderr handling. On time
 or cancellation they attempt process-tree cleanup even if the direct CLI process
 has already exited. POSIX uses a dedicated process group; Windows uses
 `taskkill /T /F`, which may not find descendants after the parent exits. Windows
-orphan cleanup is therefore not yet guaranteed. A live Windows test verified that cancelling a still-running Python parent through this adapter also terminated its spawned child. This does not cover a parent that exits before cleanup while a child retains a pipe; the PID-based `taskkill` path cannot be assumed to find that orphan. Do not connect this adapter to automatic shared-queue dispatch until that case has a verified cleanup or quarantine mechanism. Codex defaults to
+orphan cleanup is therefore not yet guaranteed. A live Windows test verified that cancelling a still-running Python parent through this adapter also terminated its spawned child. A separate disposable probe observed the opposite case: after the parent exited and a child retained a pipe, the adapter returned `timed_out` while that child remained alive. The probe then forcibly terminated and verified removal of its own child. The PID-based `taskkill` path cannot find that orphan reliably. Do not connect this adapter to automatic shared-queue dispatch until that case has a verified cleanup or quarantine mechanism. Codex defaults to
 `read-only` sandbox; `workspace-write` requires explicit construction. Claude
 defaults to restricted mode with no tools and denied permission prompts; tool
 allowlists require explicit construction. Structured stdout events contribute
