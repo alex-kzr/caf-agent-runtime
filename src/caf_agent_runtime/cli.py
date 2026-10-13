@@ -20,17 +20,36 @@ _SECRET = re.compile(
 )
 _MAX_TEXT = 4096
 _MAX_CAPTURE = 65536
+_KNOWN_EVENT_TYPES = frozenset({
+    "thread.started", "turn.started", "turn.completed", "turn.failed",
+    "item.started", "item.updated", "item.completed", "error",
+    "system", "assistant", "user", "result", "stream_event", "rate_limit_event",
+})
+_SAFE_DIAGNOSTIC_PHRASES = re.compile(
+    r"(?i)(?<![\w-])(?:401\s+unauthorized|403\s+forbidden|"
+    r"authentication failed|failed to authenticate|not authenticated|"
+    r"login required|log in again|failed to refresh token|token expired|"
+    r"invalid token|permission denied|access denied|network error|"
+    r"connection failed|request failed|stream disconnected|"
+    r"unauthorized|forbidden|auth failed)(?![\w-])"
+)
 
 
 def _redact(value: str) -> str:
     return _SECRET.sub("[REDACTED]", value)[:_MAX_TEXT]
 
 
+def _safe_diagnostic_detail(value: str) -> str:
+    """Retain only exact matched phrases from a fixed safe vocabulary."""
+    phrases = [match.group(0) for match in _SAFE_DIAGNOSTIC_PHRASES.finditer(value)]
+    return "; ".join(phrases[:4]) or "[provider detail withheld]"
+
+
 def _safe_event_type(item: object) -> str:
     if not isinstance(item, dict):
         return "unstructured"
     event_type = item.get("type")
-    if isinstance(event_type, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", event_type):
+    if isinstance(event_type, str) and event_type in _KNOWN_EVENT_TYPES:
         return event_type
     return "unknown"
 
@@ -96,6 +115,7 @@ class HostCliRuntime:
         *,
         timeout_seconds: float = 120,
         codex_sandbox: Literal["read-only", "workspace-write"] = "read-only",
+        codex_executable: Path | None = None,
         claude_tools: tuple[str, ...] = (),
     ) -> None:
         if provider not in ("codex", "claude"):
@@ -104,9 +124,16 @@ class HostCliRuntime:
             raise ValueError("timeout_seconds must be positive")
         if codex_sandbox not in ("read-only", "workspace-write"):
             raise ValueError("unsupported Codex sandbox mode")
+        if provider == "codex":
+            if codex_executable is None or not codex_executable.is_absolute() or not codex_executable.is_file():
+                raise ValueError("Codex requires an absolute path to an existing CLI executable")
+            if os.name == "nt" and codex_executable.suffix.lower() != ".exe":
+                raise ValueError("Codex on Windows requires a native .exe, not a shell wrapper")
+            codex_executable = codex_executable.resolve(strict=True)
         self.provider = provider
         self.timeout_seconds = timeout_seconds
         self.codex_sandbox = codex_sandbox
+        self.codex_executable = codex_executable
         self.claude_tools = claude_tools
         self._statuses: dict[str, AgentStatus] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
@@ -115,8 +142,9 @@ class HostCliRuntime:
 
     def command(self, workspace: Path) -> tuple[str, ...]:
         if self.provider == "codex":
+            assert self.codex_executable is not None
             return (
-                "codex", "exec", "--json", "--ephemeral", "--sandbox", self.codex_sandbox,
+                str(self.codex_executable), "exec", "--json", "--ephemeral", "--sandbox", self.codex_sandbox,
                 "--cd", str(workspace), "-",
             )
         return (
@@ -145,6 +173,7 @@ class HostCliRuntime:
         final_text: str | None = None
         stderr = ""
         diagnostic_category: str | None = None
+        diagnostic_detail: str | None = None
         process: asyncio.subprocess.Process | None = None
         failure_class: FailureClass | None = None
         status = AgentStatus.FAILED
@@ -170,12 +199,12 @@ class HostCliRuntime:
             else:
                 # A prompt is sent via stdin, never placed in argv or a shell.
                 async def read_stdout() -> None:
-                    nonlocal final_text, diagnostic_category
+                    nonlocal final_text, diagnostic_category, diagnostic_detail
                     assert process is not None and process.stdout is not None
                     pending = bytearray()
 
                     def accept_line(line: bytes) -> None:
-                        nonlocal final_text, diagnostic_category
+                        nonlocal final_text, diagnostic_category, diagnostic_detail
                         try:
                             parsed = json.loads(line)
                         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -189,8 +218,10 @@ class HostCliRuntime:
                                 detail = parsed.get("message", parsed.get("error"))
                                 if isinstance(detail, str):
                                     diagnostic_category = _diagnostic_category(detail) or diagnostic_category
+                                    diagnostic_detail = _safe_diagnostic_detail(detail)
                                 elif isinstance(detail, dict) and isinstance(detail.get("message"), str):
                                     diagnostic_category = _diagnostic_category(detail["message"]) or diagnostic_category
+                                    diagnostic_detail = _safe_diagnostic_detail(detail["message"])
                         if len(events) < 1000:
                             events.append(AgentEvent(
                                 task.run_id, task.correlation_id, len(events) + 1, kind, kind,
@@ -250,6 +281,8 @@ class HostCliRuntime:
             else:
                 status = AgentStatus.FAILED
                 diagnostic_category = diagnostic_category or _diagnostic_category(stderr)
+                if diagnostic_detail is None and stderr:
+                    diagnostic_detail = _safe_diagnostic_detail(stderr)
                 failure_class = (
                     FailureClass.INFRASTRUCTURE
                     if diagnostic_category in ("authentication", "network")
@@ -267,6 +300,7 @@ class HostCliRuntime:
             failure_class = None if was_cancelled else FailureClass.INFRASTRUCTURE
             stderr = "" if was_cancelled else _redact(str(exc))
             diagnostic_category = _diagnostic_category(stderr)
+            diagnostic_detail = None if was_cancelled else _safe_diagnostic_detail(stderr)
             if process is not None:
                 await _kill_tree(process)
         except asyncio.CancelledError:
@@ -287,7 +321,8 @@ class HostCliRuntime:
             status=status, summary=summary, events=tuple(events),
             failure_class=failure_class, exit_code=exit_code,
             output={"final_text": final_text, "stderr_tail": stderr,
-                    "diagnostic_category": diagnostic_category},
+                    "diagnostic_category": diagnostic_category,
+                    "diagnostic_detail": diagnostic_detail},
         )
 
     async def cancel(self, run_id: str) -> None:
@@ -307,9 +342,10 @@ class HostCliRuntime:
 
 
 class CodexRuntime(HostCliRuntime):
-    def __init__(self, *, timeout_seconds: float = 120,
+    def __init__(self, *, executable: Path, timeout_seconds: float = 120,
                  sandbox: Literal["read-only", "workspace-write"] = "read-only") -> None:
-        super().__init__("codex", timeout_seconds=timeout_seconds, codex_sandbox=sandbox)
+        super().__init__("codex", timeout_seconds=timeout_seconds,
+                         codex_sandbox=sandbox, codex_executable=executable)
 
 
 class ClaudeRuntime(HostCliRuntime):

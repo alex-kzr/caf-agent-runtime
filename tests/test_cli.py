@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -64,13 +65,34 @@ def task(provider: str) -> CodingTask:
     return CodingTask("run-1", "corr-1", "Sensitive task prompt", provider)
 
 
+def codex_runtime(**kwargs: object) -> CodexRuntime:
+    return CodexRuntime(executable=Path(sys.executable), **kwargs)
+
+
+def test_codex_requires_an_explicit_existing_absolute_executable(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        CodexRuntime()  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="absolute path"):
+        CodexRuntime(executable=Path("codex.exe"))
+    with pytest.raises(ValueError, match="absolute path"):
+        CodexRuntime(executable=tmp_path / "missing.exe")
+    if os.name == "nt":
+        wrapper = tmp_path / "codex.cmd"
+        wrapper.write_text("@echo off", encoding="utf-8")
+        with pytest.raises(ValueError, match="native .exe"):
+            CodexRuntime(executable=wrapper)
+    runtime = codex_runtime()
+    assert runtime.command(tmp_path)[0] == str(Path(sys.executable).resolve())
+    assert runtime.command(tmp_path)[0] != "codex"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["codex", "claude"])
 async def test_argument_array_stdin_and_redacted_events(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: str
 ) -> None:
     if provider == "codex":
-        runtime = CodexRuntime()
+        runtime = codex_runtime()
         event = {"type": "item.completed", "item": {
             "type": "agent_message", "text": "done sk-secretsecretsecret"}}
     else:
@@ -96,6 +118,7 @@ async def test_argument_array_stdin_and_redacted_events(
     assert "shell" not in kwargs
     if provider == "codex":
         assert "read-only" in args and "--json" in args
+        assert args[0] == str(Path(sys.executable).resolve())
     else:
         assert "--restricted" in args and "--permission-prompts" in args
         assert "--verbose" in args
@@ -105,7 +128,7 @@ async def test_argument_array_stdin_and_redacted_events(
 async def test_nonzero_exit_and_missing_executable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     fake = FakeProcess(b"", exit_code=9)
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
-    result = await CodexRuntime().execute(task("codex"), tmp_path)
+    result = await codex_runtime().execute(task("codex"), tmp_path)
     assert result.status == AgentStatus.FAILED
     assert result.failure_class == FailureClass.AGENT
     assert result.exit_code == 9
@@ -124,10 +147,26 @@ async def test_auth_error_is_infrastructure_failure(monkeypatch: pytest.MonkeyPa
     line = json.dumps({"type": "error", "message": "Authentication failed"}).encode() + b"\n"
     fake = FakeProcess(line, exit_code=1)
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
-    result = await CodexRuntime().execute(task("codex"), tmp_path)
+    result = await codex_runtime().execute(task("codex"), tmp_path)
     assert result.failure_class == FailureClass.INFRASTRUCTURE
     assert result.output["diagnostic_category"] == "authentication"
+    assert result.output["diagnostic_detail"] == "Authentication failed"
     assert all("Authentication failed" not in event.message for event in result.events)
+
+
+def test_diagnostic_detail_redacts_headers_tokens_urls_and_email() -> None:
+    detail = "auth failed X-Auth-Token: abc123 password=abc123 session_id=abc123 Authorization: Bearer secretsecretsecretsecretsecretsecret; https://example.test/private?token=abc admin@example.test"
+    safe = cli._safe_diagnostic_detail(detail)
+    assert safe == "auth failed"
+    for private in ("Bearer", "secretsecret", "example.test", "admin@", "abc123", "password", "session_id", "X-Auth"):
+        assert private not in safe
+    assert cli._safe_diagnostic_detail("X-Auth-Token: abc123") == "[provider detail withheld]"
+
+
+def test_provider_event_type_is_allowlisted() -> None:
+    assert cli._safe_event_type({"type": "item.completed"}) == "item.completed"
+    assert cli._safe_event_type({"type": "sk-abcdefghijklmnop"}) == "unknown"
+    assert cli._safe_event_type({"type": "X-Auth-Token"}) == "unknown"
 
 
 @pytest.mark.asyncio
@@ -148,7 +187,7 @@ async def test_timeout_and_cancel(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     killed = AsyncMock(side_effect=lambda process: waiting.set())
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(cli, "_kill_tree", killed)
-    runtime = CodexRuntime(timeout_seconds=0.01)
+    runtime = codex_runtime(timeout_seconds=0.01)
     result = await runtime.execute(task("codex"), tmp_path)
     assert result.status == AgentStatus.TIMED_OUT
     assert result.failure_class == FailureClass.TIMEOUT
@@ -156,7 +195,7 @@ async def test_timeout_and_cancel(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     waiting.clear()
     killed.reset_mock()
-    runtime = CodexRuntime(timeout_seconds=10)
+    runtime = codex_runtime(timeout_seconds=10)
     pending = asyncio.create_task(runtime.execute(task("codex"), tmp_path))
     await started.wait()
     await asyncio.sleep(0)
@@ -180,7 +219,7 @@ async def test_stalled_stdin_is_bounded_by_timeout(
     killed = AsyncMock()
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
     monkeypatch.setattr(cli, "_kill_tree", killed)
-    result = await asyncio.wait_for(CodexRuntime(timeout_seconds=0.01).execute(task("codex"), tmp_path), 1)
+    result = await asyncio.wait_for(codex_runtime(timeout_seconds=0.01).execute(task("codex"), tmp_path), 1)
     assert result.status == AgentStatus.TIMED_OUT
     killed.assert_awaited_once_with(fake)
 
@@ -204,7 +243,7 @@ async def test_cancelled_broken_pipe_stays_cancelled(
     fake.stdin.drain = broken_after_cancel  # type: ignore[method-assign]
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
     monkeypatch.setattr(cli, "_kill_tree", kill)
-    runtime = CodexRuntime()
+    runtime = codex_runtime()
     pending = asyncio.create_task(runtime.execute(task("codex"), tmp_path))
     await started.wait()
     await runtime.cancel("run-1")
@@ -229,7 +268,7 @@ async def test_parent_exited_but_inherited_pipe_times_out(
     killed = AsyncMock()
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
     monkeypatch.setattr(cli, "_kill_tree", killed)
-    result = await asyncio.wait_for(CodexRuntime(timeout_seconds=0.01).execute(task("codex"), tmp_path), 1)
+    result = await asyncio.wait_for(codex_runtime(timeout_seconds=0.01).execute(task("codex"), tmp_path), 1)
     assert result.status == AgentStatus.TIMED_OUT
     killed.assert_awaited_once_with(fake)
 
@@ -243,7 +282,7 @@ async def test_terminal_result_parsed_after_event_retention_limit(
         "type": "agent_message", "text": "late final text"}}))
     fake = FakeProcess(("\n".join(lines) + "\n").encode())
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
-    result = await CodexRuntime().execute(task("codex"), tmp_path)
+    result = await codex_runtime().execute(task("codex"), tmp_path)
     assert result.output["final_text"] == "late final text"
     assert len(result.events) == 1001  # 1 start, 999 stream events, 1 terminal
 

@@ -18,12 +18,27 @@ uv run pytest
 
 The opt-in CLI smoke runner creates and removes a disposable Git worktree under
 the system temporary directory. It sends a fixed no-tools prompt and prints only
-status, event kinds, and diagnostic categories:
+status, fixed event kinds, and allowlisted diagnostic phrases:
 
 ```sh
-uv run python scripts/smoke.py codex
 uv run python scripts/smoke.py claude
 ```
+
+Codex now requires an explicit absolute path and an expected version; there is
+no `PATH` fallback. For the verified Windows npm installation on this host,
+the native executable is
+`C:\nvm4w\nodejs\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe`
+and reports `codex-cli 0.162.1`. An example invocation is:
+
+```powershell
+uv run python scripts/smoke.py codex --codex-executable 'C:\nvm4w\nodejs\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe' --expected-version 0.162.1
+```
+
+The smoke runner checks `--version` before its one CLI invocation. Its
+diagnostic detail prints only exact phrases from a fixed safe vocabulary; any
+other provider text, headers and credentials are withheld. The underlying
+`AgentResult.stderr_tail` remains best-effort redacted and must not be printed
+or published as an unreviewed diagnostic log.
 
 The package can be installed in another local CAF service with a versioned Git
 dependency later. During local development use an editable path dependency or
@@ -91,10 +106,13 @@ lists `--print`, `--verbose`, `--output-format stream-json`, `--restricted`,
 `--permission-mode dontAsk`, `--permission-prompts none`, and
 `--no-session-persistence`. A no-tools Claude call using the existing Pro login
 exited 0, emitted `system`, `assistant`, `rate_limit_event`, and `result` events,
-and returned the expected marker. A read-only Codex smoke call exited 1 with
-`error` and `turn.failed` events and an authentication-related diagnostic,
-despite `codex login status` reporting a ChatGPT login. No credential changes
-were made. This does not verify successful Codex task execution.
+and returned the expected marker. An initial read-only Codex smoke exited 1 with
+`error` and `turn.failed` events and an authentication-category diagnostic;
+read-only investigation later found that unqualified Python `subprocess` chose
+the separate desktop CLI 0.147.0. With the npm installation's native 0.162.1
+executable supplied explicitly, **one** no-tools Codex smoke exited 0, emitted
+`item.completed`, and returned the expected marker. No credential changes were
+made. These calls do not verify a code-changing task or full workflow.
 
 **Executable resolution finding:** PowerShell's `codex` command above selected
 the npm 0.162.1 wrapper, but Python `subprocess.run(['codex', '--version'])`,
@@ -102,14 +120,14 @@ which matches this adapter's launch method, returned **0.147.0**. That version
 matches the separate desktop Codex executable in the same Windows user's local
 programs directory. Both installations reported a ChatGPT login, and the
 0.147.0 `exec --help` lists the adapter's flags. The original smoke retained
-only an authentication *category*, not the exact provider error. The executable
-mismatch must be resolved and a new isolated smoke run approved before claiming
-which Codex installation can execute tasks. The observed mismatch does not by
-itself prove the authentication failure's cause. See the umbrella
+only an authentication *category*, not the exact provider error. The successful
+explicit-path smoke establishes that the npm 0.162.1 executable can complete a
+no-tools task with the existing login. It does not prove the version mismatch
+caused the earlier failure. See the umbrella
 `docs/development/environment.md` for path and user metadata.
 
-**Still pending:** Confirm Codex execution with the existing profile; verify
-write-capable CLI paths and actual file changes in an isolated worktree;
+**Still pending:** Verify write-capable Codex and Claude tasks and actual file
+changes in an isolated worktree;
 structured session IDs and resume; provider-specific event/usage extraction;
 full secret redaction; process-tree cleanup on each supported host; and
 integration with workspace allocation, durable events and recovery. Worktrees
