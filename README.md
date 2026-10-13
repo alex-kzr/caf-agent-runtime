@@ -102,9 +102,14 @@ cancellation after the parent exits, normal completion, and preservation of an
 unrelated process. These tests use local Python processes, not Codex or Claude.
 The previous PID-based `taskkill` cleanup failed for an orphan in a disposable
 probe and is retained only as a fallback outside the Windows Job path. This
-does not establish safety for processes that explicitly break away from the
-Job or for a crashed host worker; keep shared queue CLI dispatch disabled until
-those boundaries are addressed. Codex defaults to
+does not establish universal containment for privileged processes that bypass
+the ordinary child-process path. A harmless fixture that requested Windows
+`CREATE_BREAKAWAY_FROM_JOB` did spawn on this host, but `IsProcessInJob`
+confirmed that child remained in the Job and cancellation stopped it. A
+separate test killed only its disposable runtime host process and confirmed
+Job closure stopped the child. Neither test restarts Windows or represents a
+full worker crash with a durable queue lease; keep shared queue CLI dispatch
+disabled until that recovery path is verified. Codex defaults to
 `read-only` sandbox; `workspace-write` requires explicit construction. Claude
 defaults to restricted mode with no tools and denied permission prompts; tool
 allowlists require explicit construction. Structured stdout events contribute
