@@ -371,7 +371,7 @@ class HostCliRuntime:
             )
         schema = self.structured_schemas.get(operation) if operation else None
         command = (
-            "claude", "--print", "--verbose", "--output-format",
+            "claude", "--print", *(("--verbose",) if schema is None else ()), "--output-format",
             "json" if schema is not None else "stream-json",
             "--permission-mode", "dontAsk", "--permission-prompts", "none",
             "--restricted", "--strict-mcp-config", "--no-session-persistence", "--tools",

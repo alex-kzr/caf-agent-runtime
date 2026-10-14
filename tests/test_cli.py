@@ -138,6 +138,7 @@ async def test_claude_schema_argument_and_structured_envelope(
     assert "PRIVATE prose" not in str(result.output)
     args = seen[0]
     assert args[args.index("--output-format") + 1] == "json"
+    assert "--verbose" not in args
     assert json.loads(args[args.index("--json-schema") + 1]) == schema
     assert args[args.index("--tools") + 1] == ""
     assert args[args.index("--disallowedTools") + 1] == "mcp__*"
@@ -145,6 +146,7 @@ async def test_claude_schema_argument_and_structured_envelope(
     assert "--mcp-config" not in args
     assert "--json-schema" not in runtime.command(tmp_path, "review")
     assert runtime.command(tmp_path, "review")[4] == "stream-json"
+    assert "--verbose" in runtime.command(tmp_path, "review")
 
 
 @pytest.mark.asyncio
