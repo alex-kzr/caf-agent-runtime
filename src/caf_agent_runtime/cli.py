@@ -10,7 +10,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping
 
 from .contract import AgentEvent, AgentResult, AgentStatus, CodingTask, FailureClass
 from .windows_job import ProcessTreeCleanupError, WindowsJob
@@ -39,6 +39,7 @@ _SECRET = re.compile(
 )
 _MAX_TEXT = 4096
 _MAX_CAPTURE = 65536
+_MAX_STRUCTURED_TEXT = 16384
 _KNOWN_EVENT_TYPES = frozenset({
     "thread.started", "turn.started", "turn.completed", "turn.failed",
     "item.started", "item.updated", "item.completed", "error",
@@ -56,6 +57,19 @@ _SAFE_DIAGNOSTIC_PHRASES = re.compile(
 
 def _redact(value: str) -> str:
     return _SECRET.sub("[REDACTED]", value)[:_MAX_TEXT]
+
+
+class _DuplicateJSONField(ValueError):
+    pass
+
+
+def _unique_json_fields(pairs: list[tuple[str, object]]) -> dict:
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJSONField
+        value[key] = item
+    return value
 
 
 def _safe_diagnostic_detail(value: str) -> str:
@@ -137,6 +151,7 @@ class HostCliRuntime:
         codex_sandbox: Literal["read-only", "workspace-write"] = "read-only",
         codex_executable: Path | None = None,
         claude_tools: tuple[str, ...] = (),
+        structured_schemas: Mapping[str, dict] | None = None,
     ) -> None:
         if provider not in ("codex", "claude"):
             raise ValueError("provider must be codex or claude")
@@ -155,25 +170,32 @@ class HostCliRuntime:
         self.codex_sandbox = codex_sandbox
         self.codex_executable = codex_executable
         self.claude_tools = claude_tools
+        self.structured_schemas = dict(structured_schemas or {})
+        if self.structured_schemas and provider != "claude":
+            raise ValueError("structured schemas require Claude runtime")
         self._statuses: dict[str, AgentStatus] = {}
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._jobs: dict[str, WindowsJob] = {}
         self._cancelled: set[str] = set()
         self._lock = asyncio.Lock()
 
-    def command(self, workspace: Path) -> tuple[str, ...]:
+    def command(self, workspace: Path, operation: str | None = None) -> tuple[str, ...]:
         if self.provider == "codex":
             assert self.codex_executable is not None
             return (
                 str(self.codex_executable), "exec", "--json", "--ephemeral", "--sandbox", self.codex_sandbox,
                 "--cd", str(workspace), "-",
             )
-        return (
-            "claude", "--print", "--verbose", "--output-format", "stream-json",
+        schema = self.structured_schemas.get(operation) if operation else None
+        command = (
+            "claude", "--print", "--verbose", "--output-format",
+            "json" if schema is not None else "stream-json",
             "--permission-mode", "dontAsk", "--permission-prompts", "none",
             "--restricted", "--no-session-persistence", "--tools",
             ",".join(self.claude_tools),
         )
+        return command + (("--json-schema", json.dumps(schema, separators=(",", ":")))
+                          if schema is not None else ())
 
     async def execute(
         self, task: CodingTask, workspace: Path, session_id: str | None = None
@@ -192,6 +214,7 @@ class HostCliRuntime:
 
         events = [AgentEvent(task.run_id, task.correlation_id, 1, "started", self.provider)]
         final_text: str | None = None
+        response_source = "none"
         stderr = ""
         diagnostic_category: str | None = None
         diagnostic_detail: str | None = None
@@ -205,7 +228,9 @@ class HostCliRuntime:
             flags = {"start_new_session": True} if os.name != "nt" else {
                 "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP,
             }
-            command = self.command(workspace)
+            structured_mode = task.operation in self.structured_schemas
+            command = (self.command(workspace, task.operation) if structured_mode
+                       else self.command(workspace))
             if _WINDOWS_JOB_ENABLED:
                 job = WindowsJob()
                 command = (sys.executable, "-m", "caf_agent_runtime._windows_supervisor", *command)
@@ -244,8 +269,51 @@ class HostCliRuntime:
                     await process.stdin.drain()
                 # A prompt is sent via stdin, never placed in argv or a shell.
                 async def read_stdout() -> None:
-                    nonlocal final_text, diagnostic_category, diagnostic_detail
+                    nonlocal final_text, response_source, diagnostic_category, diagnostic_detail
                     assert process is not None and process.stdout is not None
+                    if structured_mode:
+                        captured = bytearray()
+                        oversized = False
+                        while chunk := await process.stdout.read(4096):
+                            if len(captured) + len(chunk) > _MAX_CAPTURE:
+                                oversized = True
+                            if not oversized:
+                                captured.extend(chunk)
+                        if oversized:
+                            response_source = "oversized_envelope"
+                            return
+                        try:
+                            envelope = json.loads(captured, object_pairs_hook=_unique_json_fields)
+                        except (json.JSONDecodeError, UnicodeDecodeError, _DuplicateJSONField):
+                            response_source = "invalid_envelope"
+                            return
+                        if not isinstance(envelope, dict):
+                            response_source = "invalid_envelope"
+                            return
+                        if (envelope.get("type") != "result"
+                                or envelope.get("subtype", "success") != "success"
+                                or envelope.get("is_error", False) is not False):
+                            response_source = "invalid_envelope"
+                            return
+                        if len(events) < 1000:
+                            kind = _safe_event_type(envelope)
+                            events.append(AgentEvent(task.run_id, task.correlation_id,
+                                                     len(events) + 1, kind, kind))
+                        structured = envelope.get("structured_output")
+                        if structured is None:
+                            response_source = "missing_structured_output"
+                            return
+                        candidate = json.dumps(structured, ensure_ascii=False,
+                                               separators=(",", ":"))
+                        if len(candidate.encode("utf-8")) > _MAX_STRUCTURED_TEXT:
+                            response_source = "oversized_structured_output"
+                            return
+                        if _SECRET.search(candidate):
+                            response_source = "sensitive_structured_output"
+                            return
+                        final_text = candidate
+                        response_source = "structured_output"
+                        return
                     pending = bytearray()
 
                     def accept_line(line: bytes) -> None:
@@ -259,6 +327,7 @@ class HostCliRuntime:
                             candidate = _result_text(parsed)
                             if candidate is not None:
                                 final_text = candidate
+                                response_source = "result_text"
                             if kind in ("error", "turn.failed") and isinstance(parsed, dict):
                                 detail = parsed.get("message", parsed.get("error"))
                                 if isinstance(detail, str):
@@ -388,6 +457,7 @@ class HostCliRuntime:
             status=status, summary=summary, events=tuple(events),
             failure_class=failure_class, exit_code=exit_code,
             output={"final_text": final_text, "stderr_tail": stderr,
+                    "response_source": response_source,
                     "diagnostic_category": diagnostic_category,
                     "diagnostic_detail": diagnostic_detail},
         )
@@ -422,5 +492,7 @@ class CodexRuntime(HostCliRuntime):
 
 class ClaudeRuntime(HostCliRuntime):
     def __init__(self, *, timeout_seconds: float = 120,
-                 tools: tuple[str, ...] = ()) -> None:
-        super().__init__("claude", timeout_seconds=timeout_seconds, claude_tools=tools)
+                 tools: tuple[str, ...] = (),
+                 structured_schemas: Mapping[str, dict] | None = None) -> None:
+        super().__init__("claude", timeout_seconds=timeout_seconds,
+                         claude_tools=tools, structured_schemas=structured_schemas)

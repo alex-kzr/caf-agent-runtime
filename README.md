@@ -118,6 +118,22 @@ best-effort token pattern. Authentication and network errors detected in output
 are infrastructure failures, other nonzero exits are agent failures. No CLI
 authentication material is copied into the runtime.
 
+For a Claude operation configured with `structured_schemas`, the adapter sends
+the JSON Schema via `--json-schema` and selects the documented `json` output
+envelope. It reads only `structured_output` as the operation result; a text
+`result` is never substituted when that field is absent. The envelope is read
+with a size limit, and the structured value is bounded before it reaches the
+caller. Duplicate JSON fields and secretlike structured content fail closed
+before any local parser can accept a transformed value. Operation code must
+validate the value and avoid persisting arbitrary
+provider content. Other Claude operations retain the `stream-json` path.
+Offline fake-process tests cover a structured envelope, missing structured
+output, an error envelope, duplicate fields, sensitive content, and an invalid
+root type. The combination of CLI
+flags has not been tested against a live Claude process. The envelope and
+`--json-schema` usage follow Claude Code's
+[programmatic CLI documentation](https://code.claude.com/docs/en/headless#get-structured-output).
+
 Every CLI child now receives an explicit minimal environment: OS executable
 lookup and user profile/config directory paths, plus `CODEX_HOME` or
 `CLAUDE_CONFIG_DIR` if set. It does not inherit `CAF_WORKER_TOKEN`, database
@@ -130,7 +146,7 @@ added explicitly rather than restoring full inheritance.
 
 **Verified locally on 2026-10-13:** `codex-cli 0.162.1` help lists `exec`,
 `--json`, `--ephemeral`, `--sandbox`, and `--cd`. `Claude Code 2.1.296` help
-lists `--print`, `--verbose`, `--output-format stream-json`, `--restricted`,
+lists `--print`, `--verbose`, `--output-format`, `--json-schema`, `--restricted`,
 `--permission-mode dontAsk`, `--permission-prompts none`, and
 `--no-session-persistence`. A no-tools Claude call using the existing Pro login
 exited 0, emitted `system`, `assistant`, `rate_limit_event`, and `result` events,

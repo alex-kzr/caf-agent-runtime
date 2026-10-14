@@ -94,6 +94,92 @@ def test_child_environment_excludes_transport_and_model_credentials() -> None:
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("envelope,expected_source,expected_text", [
+    ({"type": "result", "result": "PRIVATE prose",
+      "structured_output": {"steps": ["inspect", "verify"]}},
+     "structured_output", '{"steps":["inspect","verify"]}'),
+    ({"type": "result", "result": '{"steps":["text fallback"]}'},
+     "missing_structured_output", None),
+    ({"type": "result", "structured_output": ["wrong root"]},
+     "structured_output", '["wrong root"]'),
+    ({"type": "error", "structured_output": {"steps": ["wrong event"]}},
+     "invalid_envelope", None),
+    ({"type": "result", "subtype": "error_during_execution",
+      "structured_output": {"steps": ["wrong subtype"]}},
+     "invalid_envelope", None),
+    ({"type": "result", "is_error": True,
+      "structured_output": {"steps": ["wrong status"]}},
+     "invalid_envelope", None),
+])
+async def test_claude_schema_argument_and_structured_envelope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    envelope: dict, expected_source: str, expected_text: str | None,
+) -> None:
+    schema = {"type": "object", "properties": {"steps": {"type": "array"}},
+              "required": ["steps"], "additionalProperties": False}
+    runtime = ClaudeRuntime(tools=(), structured_schemas={"plan": schema})
+    fake = FakeProcess(json.dumps(envelope, indent=2).encode())
+    seen = []
+
+    async def spawn(*args: object, **kwargs: object) -> FakeProcess:
+        seen.append(args)
+        return fake
+
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", spawn)
+    request = CodingTask("plan-1", "corr-1", "PRIVATE prompt", "claude", "plan")
+    result = await runtime.execute(request, tmp_path)
+    assert result.status == AgentStatus.SUCCEEDED
+    assert result.output["response_source"] == expected_source
+    assert result.output["final_text"] == expected_text
+    assert "PRIVATE prose" not in str(result.output)
+    args = seen[0]
+    assert args[args.index("--output-format") + 1] == "json"
+    assert json.loads(args[args.index("--json-schema") + 1]) == schema
+    assert args[args.index("--tools") + 1] == ""
+    assert "--json-schema" not in runtime.command(tmp_path, "review")
+    assert runtime.command(tmp_path, "review")[4] == "stream-json"
+
+
+@pytest.mark.asyncio
+async def test_structured_envelope_preserves_schema_valid_unicode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    steps = ["😀" * 300 for _ in range(8)]
+    fake = FakeProcess(json.dumps({"type": "result", "subtype": "success",
+                                   "is_error": False,
+                                   "structured_output": {"steps": steps}}).encode())
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
+    runtime = ClaudeRuntime(structured_schemas={"plan": {"type": "object"}})
+    result = await runtime.execute(CodingTask("plan-2", "corr-2", "prompt", "claude", "plan"),
+                                   tmp_path)
+    assert result.output["response_source"] == "structured_output"
+    assert json.loads(result.output["final_text"]) == {"steps": steps}
+    assert len(result.output["final_text"].encode()) > 4096
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("envelope,expected_source", [
+    ('{"type":"result","structured_output":{"steps":["ok"],"steps":["bad"]}}',
+     "invalid_envelope"),
+    (json.dumps({"type": "result", "structured_output": {
+        "steps": ["x" * 300 + " sk-abcdefghijklmnop"]}}),
+     "sensitive_structured_output"),
+])
+async def test_structured_envelope_rejects_duplicate_or_sensitive_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    envelope: str, expected_source: str,
+) -> None:
+    fake = FakeProcess(envelope.encode())
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
+    runtime = ClaudeRuntime(structured_schemas={"plan": {"type": "object"}})
+    result = await runtime.execute(CodingTask("plan-3", "corr-3", "prompt", "claude", "plan"),
+                                   tmp_path)
+    assert result.output["response_source"] == expected_source
+    assert result.output["final_text"] is None
+    assert "sk-abcdefghijklmnop" not in str(result.output)
+
+
 def test_codex_requires_an_explicit_existing_absolute_executable(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         CodexRuntime()  # type: ignore[call-arg]
