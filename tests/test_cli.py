@@ -140,6 +140,7 @@ async def test_claude_schema_argument_and_structured_envelope(
     assert args[args.index("--output-format") + 1] == "json"
     assert json.loads(args[args.index("--json-schema") + 1]) == schema
     assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--disallowedTools") + 1] == "mcp__*"
     assert "--json-schema" not in runtime.command(tmp_path, "review")
     assert runtime.command(tmp_path, "review")[4] == "stream-json"
 

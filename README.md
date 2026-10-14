@@ -147,6 +147,10 @@ An unrecognized root array remains rejected. The runtime records only bounded
 shape counts and the position class of a sole tagged result, never an array
 element. The official JSON contract inspected so far does not establish an
 array wrapper for this CLI invocation.
+The argv also denies `mcp__*`: Claude Code documents that `--tools ""` disables
+built-in tools but does not restrict MCP tools. The installed 2.1.296 help
+lists `--disallowedTools`; the combined no-tools invocation remains untested
+against a live process after this change.
 
 Every CLI child now receives an explicit minimal environment: OS executable
 lookup and user profile/config directory paths, plus `CODEX_HOME` or

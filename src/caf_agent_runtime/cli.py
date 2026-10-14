@@ -375,7 +375,7 @@ class HostCliRuntime:
             "json" if schema is not None else "stream-json",
             "--permission-mode", "dontAsk", "--permission-prompts", "none",
             "--restricted", "--no-session-persistence", "--tools",
-            ",".join(self.claude_tools),
+            ",".join(self.claude_tools), "--disallowedTools", "mcp__*",
         )
         return command + (("--json-schema", json.dumps(schema, separators=(",", ":")))
                           if schema is not None else ())
