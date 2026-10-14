@@ -63,6 +63,14 @@ class _DuplicateJSONField(ValueError):
     pass
 
 
+class _NonJSONConstant(ValueError):
+    pass
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise _NonJSONConstant
+
+
 def _unique_json_fields(pairs: list[tuple[str, object]]) -> dict:
     value = {}
     for key, item in pairs:
@@ -70,6 +78,145 @@ def _unique_json_fields(pairs: list[tuple[str, object]]) -> dict:
             raise _DuplicateJSONField
         value[key] = item
     return value
+
+
+def _json_kind(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    return "number"
+
+
+def _field_kind(value: dict, name: str) -> str:
+    return _json_kind(value[name]) if name in value else "missing"
+
+
+def _tag_kind(value: dict, name: str, expected: str) -> str:
+    if name not in value:
+        return "missing"
+    if not isinstance(value[name], str):
+        return "non_string"
+    return expected if value[name] == expected else "other"
+
+
+def _error_flag_kind(value: dict) -> str:
+    if "is_error" not in value:
+        return "missing"
+    if value["is_error"] is True:
+        return "true"
+    if value["is_error"] is False:
+        return "false"
+    return "non_boolean"
+
+
+def _structured_envelope(data: bytes, schema: dict,
+                         oversized: bool = False) -> tuple[str | None, dict]:
+    """Extract one documented JSON result with fixed metadata, never raw fields."""
+    diagnostic = {
+        "reason": "ok", "framing": "single_json", "root_type": None,
+        "type_tag": None, "subtype_tag": None, "status_tag": None,
+        "is_error": None,
+        "result_type": None, "structured_output_type": None,
+        "nested_structured_output_type": None,
+        "stdout_bytes_capped": min(len(data), _MAX_CAPTURE + 1),
+    }
+
+    def reject(reason: str) -> tuple[None, dict]:
+        diagnostic["reason"] = reason
+        return None, diagnostic
+
+    if oversized:
+        diagnostic["framing"] = "oversized"
+        diagnostic["stdout_bytes_capped"] = _MAX_CAPTURE + 1
+        return reject("oversized_envelope")
+    if not data.strip():
+        diagnostic["framing"] = "empty"
+        return reject("empty_stdout")
+    try:
+        raw = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        diagnostic["framing"] = "invalid_utf8"
+        return reject("invalid_utf8")
+    try:
+        envelope = json.loads(raw, object_pairs_hook=_unique_json_fields,
+                              parse_constant=_reject_json_constant)
+    except _DuplicateJSONField:
+        diagnostic["framing"] = "duplicate_keys"
+        return reject("duplicate_keys")
+    except _NonJSONConstant:
+        diagnostic["framing"] = "invalid_json"
+        return reject("malformed_json")
+    except json.JSONDecodeError as exc:
+        diagnostic["framing"] = "invalid_json"
+        if exc.msg == "Extra data":
+            suffix = raw[exc.pos:].lstrip()
+            try:
+                json.JSONDecoder(object_pairs_hook=_unique_json_fields,
+                                 parse_constant=_reject_json_constant).raw_decode(suffix)
+            except (json.JSONDecodeError, _DuplicateJSONField, _NonJSONConstant,
+                    RecursionError, ValueError):
+                diagnostic["framing"] = "trailing_data"
+                return reject("trailing_data")
+            diagnostic["framing"] = "multiple_json_values"
+            return reject("multiple_json_values")
+        return reject("malformed_json")
+    except (RecursionError, ValueError):
+        diagnostic["framing"] = "invalid_json"
+        return reject("malformed_json")
+    diagnostic["root_type"] = _json_kind(envelope)
+    if not isinstance(envelope, dict):
+        return reject("root_type")
+    diagnostic["type_tag"] = _tag_kind(envelope, "type", "result")
+    diagnostic["subtype_tag"] = _tag_kind(envelope, "subtype", "success")
+    diagnostic["status_tag"] = _tag_kind(envelope, "status", "success")
+    if envelope.get("status") == "error":
+        diagnostic["status_tag"] = "error"
+    diagnostic["is_error"] = _error_flag_kind(envelope)
+    diagnostic["result_type"] = _field_kind(envelope, "result")
+    diagnostic["structured_output_type"] = _field_kind(envelope, "structured_output")
+    result = envelope.get("result")
+    diagnostic["nested_structured_output_type"] = (
+        _field_kind(result, "structured_output") if isinstance(result, dict) else "missing")
+    if diagnostic["is_error"] == "true":
+        return reject("provider_error")
+    if diagnostic["status_tag"] == "error":
+        return reject("provider_error")
+    if diagnostic["is_error"] == "non_boolean":
+        return reject("invalid_error_flag")
+    # The documented single-JSON envelope promises structured_output, but does
+    # not require type/subtype fields. Check their values only when present.
+    if diagnostic["type_tag"] not in ("missing", "result"):
+        return reject("unexpected_type_tag")
+    if diagnostic["subtype_tag"] not in ("missing", "success"):
+        return reject("unexpected_subtype")
+    if diagnostic["status_tag"] not in ("missing", "success"):
+        return reject("unexpected_status")
+    if "structured_output" not in envelope:
+        return reject("missing_structured_output")
+    expected = schema.get("type")
+    if not isinstance(expected, str) or expected not in {
+            "object", "array", "string", "number", "boolean", "null"}:
+        return reject("unsupported_schema_root")
+    if diagnostic["structured_output_type"] != expected:
+        return reject("structured_output_type")
+    structured = envelope["structured_output"]
+    try:
+        candidate = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
+    except (RecursionError, ValueError):
+        diagnostic["framing"] = "invalid_json"
+        return reject("malformed_json")
+    if len(candidate.encode("utf-8")) > _MAX_STRUCTURED_TEXT:
+        return reject("oversized_structured_output")
+    if _SECRET.search(candidate):
+        return reject("sensitive_structured_output")
+    return candidate, diagnostic
 
 
 def _safe_diagnostic_detail(value: str) -> str:
@@ -215,6 +362,7 @@ class HostCliRuntime:
         events = [AgentEvent(task.run_id, task.correlation_id, 1, "started", self.provider)]
         final_text: str | None = None
         response_source = "none"
+        envelope_diagnostic: dict | None = None
         stderr = ""
         diagnostic_category: str | None = None
         diagnostic_detail: str | None = None
@@ -269,7 +417,8 @@ class HostCliRuntime:
                     await process.stdin.drain()
                 # A prompt is sent via stdin, never placed in argv or a shell.
                 async def read_stdout() -> None:
-                    nonlocal final_text, response_source, diagnostic_category, diagnostic_detail
+                    nonlocal final_text, response_source, envelope_diagnostic
+                    nonlocal diagnostic_category, diagnostic_detail
                     assert process is not None and process.stdout is not None
                     if structured_mode:
                         captured = bytearray()
@@ -279,40 +428,13 @@ class HostCliRuntime:
                                 oversized = True
                             if not oversized:
                                 captured.extend(chunk)
-                        if oversized:
-                            response_source = "oversized_envelope"
-                            return
-                        try:
-                            envelope = json.loads(captured, object_pairs_hook=_unique_json_fields)
-                        except (json.JSONDecodeError, UnicodeDecodeError, _DuplicateJSONField):
-                            response_source = "invalid_envelope"
-                            return
-                        if not isinstance(envelope, dict):
-                            response_source = "invalid_envelope"
-                            return
-                        if (envelope.get("type") != "result"
-                                or envelope.get("subtype", "success") != "success"
-                                or envelope.get("is_error", False) is not False):
-                            response_source = "invalid_envelope"
-                            return
-                        if len(events) < 1000:
-                            kind = _safe_event_type(envelope)
+                        final_text, envelope_diagnostic = _structured_envelope(
+                            captured, self.structured_schemas[task.operation], oversized)
+                        response_source = ("structured_output" if final_text is not None
+                                           else "rejected_envelope")
+                        if final_text is not None and len(events) < 1000:
                             events.append(AgentEvent(task.run_id, task.correlation_id,
-                                                     len(events) + 1, kind, kind))
-                        structured = envelope.get("structured_output")
-                        if structured is None:
-                            response_source = "missing_structured_output"
-                            return
-                        candidate = json.dumps(structured, ensure_ascii=False,
-                                               separators=(",", ":"))
-                        if len(candidate.encode("utf-8")) > _MAX_STRUCTURED_TEXT:
-                            response_source = "oversized_structured_output"
-                            return
-                        if _SECRET.search(candidate):
-                            response_source = "sensitive_structured_output"
-                            return
-                        final_text = candidate
-                        response_source = "structured_output"
+                                                     len(events) + 1, "result", "result"))
                         return
                     pending = bytearray()
 
@@ -391,7 +513,12 @@ class HostCliRuntime:
             if was_cancelled:
                 status = AgentStatus.CANCELLED
             elif exit_code == 0:
-                status = AgentStatus.SUCCEEDED
+                if structured_mode and envelope_diagnostic is not None \
+                        and envelope_diagnostic["reason"] != "ok":
+                    status = AgentStatus.FAILED
+                    failure_class = FailureClass.AGENT
+                else:
+                    status = AgentStatus.SUCCEEDED
             else:
                 status = AgentStatus.FAILED
                 diagnostic_category = diagnostic_category or _diagnostic_category(stderr)
@@ -458,6 +585,7 @@ class HostCliRuntime:
             failure_class=failure_class, exit_code=exit_code,
             output={"final_text": final_text, "stderr_tail": stderr,
                     "response_source": response_source,
+                    "envelope_diagnostic": envelope_diagnostic,
                     "diagnostic_category": diagnostic_category,
                     "diagnostic_detail": diagnostic_detail},
         )

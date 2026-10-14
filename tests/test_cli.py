@@ -95,26 +95,26 @@ def test_child_environment_excludes_transport_and_model_credentials() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("envelope,expected_source,expected_text", [
+@pytest.mark.parametrize("envelope,expected_reason,expected_text", [
     ({"type": "result", "result": "PRIVATE prose",
       "structured_output": {"steps": ["inspect", "verify"]}},
-     "structured_output", '{"steps":["inspect","verify"]}'),
+     "ok", '{"steps":["inspect","verify"]}'),
     ({"type": "result", "result": '{"steps":["text fallback"]}'},
      "missing_structured_output", None),
     ({"type": "result", "structured_output": ["wrong root"]},
-     "structured_output", '["wrong root"]'),
+     "structured_output_type", None),
     ({"type": "error", "structured_output": {"steps": ["wrong event"]}},
-     "invalid_envelope", None),
+     "unexpected_type_tag", None),
     ({"type": "result", "subtype": "error_during_execution",
       "structured_output": {"steps": ["wrong subtype"]}},
-     "invalid_envelope", None),
+     "unexpected_subtype", None),
     ({"type": "result", "is_error": True,
       "structured_output": {"steps": ["wrong status"]}},
-     "invalid_envelope", None),
+     "provider_error", None),
 ])
 async def test_claude_schema_argument_and_structured_envelope(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    envelope: dict, expected_source: str, expected_text: str | None,
+    envelope: dict, expected_reason: str, expected_text: str | None,
 ) -> None:
     schema = {"type": "object", "properties": {"steps": {"type": "array"}},
               "required": ["steps"], "additionalProperties": False}
@@ -129,8 +129,11 @@ async def test_claude_schema_argument_and_structured_envelope(
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", spawn)
     request = CodingTask("plan-1", "corr-1", "PRIVATE prompt", "claude", "plan")
     result = await runtime.execute(request, tmp_path)
-    assert result.status == AgentStatus.SUCCEEDED
-    assert result.output["response_source"] == expected_source
+    assert result.status == (AgentStatus.SUCCEEDED if expected_reason == "ok"
+                             else AgentStatus.FAILED)
+    assert result.output["response_source"] == (
+        "structured_output" if expected_reason == "ok" else "rejected_envelope")
+    assert result.output["envelope_diagnostic"]["reason"] == expected_reason
     assert result.output["final_text"] == expected_text
     assert "PRIVATE prose" not in str(result.output)
     args = seen[0]
@@ -159,25 +162,74 @@ async def test_structured_envelope_preserves_schema_valid_unicode(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("envelope,expected_source", [
+@pytest.mark.parametrize("envelope,expected_reason", [
     ('{"type":"result","structured_output":{"steps":["ok"],"steps":["bad"]}}',
-     "invalid_envelope"),
+     "duplicate_keys"),
     (json.dumps({"type": "result", "structured_output": {
         "steps": ["x" * 300 + " sk-abcdefghijklmnop"]}}),
      "sensitive_structured_output"),
 ])
 async def test_structured_envelope_rejects_duplicate_or_sensitive_content(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    envelope: str, expected_source: str,
+    envelope: str, expected_reason: str,
 ) -> None:
     fake = FakeProcess(envelope.encode())
     monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
     runtime = ClaudeRuntime(structured_schemas={"plan": {"type": "object"}})
     result = await runtime.execute(CodingTask("plan-3", "corr-3", "prompt", "claude", "plan"),
                                    tmp_path)
-    assert result.output["response_source"] == expected_source
+    assert result.status == AgentStatus.FAILED
+    assert result.output["response_source"] == "rejected_envelope"
+    assert result.output["envelope_diagnostic"]["reason"] == expected_reason
     assert result.output["final_text"] is None
     assert "sk-abcdefghijklmnop" not in str(result.output)
+
+
+@pytest.mark.parametrize(
+    "case", json.loads((Path(__file__).parent / "fixtures/claude_envelopes.json")
+                       .read_text(encoding="utf-8")),
+    ids=lambda case: case["name"],
+)
+def test_structured_envelope_contract_fixtures(case: dict) -> None:
+    candidate, diagnostic = cli._structured_envelope(
+        case["stdout"].encode(), {"type": "object"})
+    assert diagnostic["reason"] == case["reason"]
+    assert diagnostic["framing"] == case["framing"]
+    for key in ("root_type", "type_tag", "subtype_tag", "status_tag", "is_error",
+                "result_type", "structured_output_type",
+                "nested_structured_output_type"):
+        if key in case:
+            assert diagnostic[key] == case[key]
+    assert (candidate is not None) == (case["reason"] == "ok")
+    assert "PRIVATE" not in json.dumps(diagnostic)
+
+
+def test_structured_envelope_invalid_utf8_and_size_are_fixed_codes() -> None:
+    _, invalid = cli._structured_envelope(b"\xff", {"type": "object"})
+    assert (invalid["reason"], invalid["framing"]) == ("invalid_utf8", "invalid_utf8")
+    _, oversized = cli._structured_envelope(b"private", {"type": "object"}, True)
+    assert (oversized["reason"], oversized["framing"]) == ("oversized_envelope", "oversized")
+    assert oversized["stdout_bytes_capped"] == cli._MAX_CAPTURE + 1
+    _, unsupported = cli._structured_envelope(
+        b'{"structured_output":{"steps":["ok"]}}', {"type": ["object", "null"]})
+    assert unsupported["reason"] == "unsupported_schema_root"
+
+
+@pytest.mark.parametrize("stdout", [
+    b'{"structured_output":' + b'{"x":' * 3500 + b'0' + b'}' * 3500 + b'}',
+    b'{"structured_output":{"value":' + b'1' * 5000 + b'}}',
+    b'{"structured_output":{}} ' + b'[' * 3500 + b'0' + b']' * 3500,
+], ids=["deep_object", "long_integer", "deep_trailing_value"])
+def test_structured_envelope_pathological_json_has_fixed_reason(stdout: bytes) -> None:
+    candidate, diagnostic = cli._structured_envelope(stdout, {"type": "object"})
+    assert candidate is None
+    assert diagnostic["reason"] in {"malformed_json", "trailing_data", "multiple_json_values"}
+    assert diagnostic["framing"] in {"invalid_json", "trailing_data", "multiple_json_values"}
+    assert set(diagnostic) == {
+        "reason", "framing", "root_type", "type_tag", "subtype_tag", "status_tag",
+        "is_error", "result_type", "structured_output_type",
+        "nested_structured_output_type", "stdout_bytes_capped",
+    }
 
 
 def test_codex_requires_an_explicit_existing_absolute_executable(tmp_path: Path) -> None:

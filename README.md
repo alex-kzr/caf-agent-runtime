@@ -134,6 +134,16 @@ flags has not been tested against a live Claude process. The envelope and
 `--json-schema` usage follow Claude Code's
 [programmatic CLI documentation](https://code.claude.com/docs/en/headless#get-structured-output).
 
+The later offline envelope diagnostic gives each rejection a fixed reason and
+framing code, fixed JSON type categories and a capped byte count. Absent
+`type`/`subtype` tags are accepted because the documented JSON contract does
+not require them; present tags, `status` and `is_error` must indicate success.
+The adapter never falls back to text `result` or a nested structured value.
+Exit-zero envelope rejection is reported as an agent failure. Raw provider
+fields, response content and unknown field names are not retained in this
+diagnostic. See the umbrella
+[envelope diagnostic gate](../../docs/experiments/2026-10-14-envelope-diagnostic-gate.md).
+
 Every CLI child now receives an explicit minimal environment: OS executable
 lookup and user profile/config directory paths, plus `CODEX_HOME` or
 `CLAUDE_CONFIG_DIR` if set. It does not inherit `CAF_WORKER_TOKEN`, database

@@ -1,0 +1,20 @@
+[
+  {"name":"documented_minimal","stdout":"{\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"ok","framing":"single_json","type_tag":"missing","result_type":"missing","structured_output_type":"object"},
+  {"name":"result_with_text","stdout":"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"text\",\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"ok","framing":"single_json","type_tag":"result","result_type":"string","structured_output_type":"object"},
+  {"name":"jsonl_frames","stdout":"{\"type\":\"system\"}\n{\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"multiple_json_values","framing":"multiple_json_values"},
+  {"name":"trailing_text","stdout":"{\"structured_output\":{\"steps\":[\"ok\"]}} PRIVATE","reason":"trailing_data","framing":"trailing_data"},
+  {"name":"duplicate_keys","stdout":"{\"structured_output\":{\"steps\":[\"ok\"],\"steps\":[\"bad\"]}}","reason":"duplicate_keys","framing":"duplicate_keys"},
+  {"name":"array_root","stdout":"[]","reason":"root_type","framing":"single_json","root_type":"array"},
+  {"name":"provider_error","stdout":"{\"is_error\":true,\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"provider_error","framing":"single_json","is_error":"true"},
+  {"name":"provider_status_error","stdout":"{\"status\":\"error\",\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"provider_error","framing":"single_json","status_tag":"error"},
+  {"name":"error_flag_type","stdout":"{\"is_error\":\"false\",\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"invalid_error_flag","framing":"single_json","is_error":"non_boolean"},
+  {"name":"unexpected_type","stdout":"{\"type\":\"error\",\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"unexpected_type_tag","framing":"single_json","type_tag":"other"},
+  {"name":"unexpected_subtype","stdout":"{\"subtype\":\"error_during_execution\",\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"unexpected_subtype","framing":"single_json","subtype_tag":"other"},
+  {"name":"unexpected_status","stdout":"{\"status\":\"pending\",\"structured_output\":{\"steps\":[\"ok\"]}}","reason":"unexpected_status","framing":"single_json","status_tag":"other"},
+  {"name":"missing_structured","stdout":"{\"result\":\"PRIVATE text\"}","reason":"missing_structured_output","framing":"single_json","result_type":"string","structured_output_type":"missing"},
+  {"name":"nested_structured_only","stdout":"{\"result\":{\"structured_output\":{\"steps\":[\"ok\"]}}}","reason":"missing_structured_output","framing":"single_json","result_type":"object","nested_structured_output_type":"object"},
+  {"name":"structured_wrong_type","stdout":"{\"structured_output\":[\"ok\"]}","reason":"structured_output_type","framing":"single_json","structured_output_type":"array"},
+  {"name":"malformed","stdout":"{\"structured_output\":","reason":"malformed_json","framing":"invalid_json"},
+  {"name":"non_json_number","stdout":"{\"structured_output\":NaN}","reason":"malformed_json","framing":"invalid_json"},
+  {"name":"empty","stdout":"","reason":"empty_stdout","framing":"empty"}
+]
