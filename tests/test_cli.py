@@ -215,6 +215,37 @@ def test_structured_envelope_invalid_utf8_and_size_are_fixed_codes() -> None:
     assert unsupported["reason"] == "unsupported_schema_root"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("escaped,expected_reason,expected_value", [
+    (r"\ud800", "malformed_json", None),
+    (r"\udc00", "malformed_json", None),
+    (r"\ud83d\ude00", "ok", "😀"),
+], ids=["lone_high_surrogate", "lone_low_surrogate", "valid_surrogate_pair"])
+async def test_structured_envelope_surrogates_keep_fixed_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    escaped: str, expected_reason: str, expected_value: str | None,
+) -> None:
+    raw = ('{"structured_output":{"steps":["' + escaped + '"]}}').encode("ascii")
+    fake = FakeProcess(raw)
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", AsyncMock(return_value=fake))
+    runtime = ClaudeRuntime(structured_schemas={"plan": {"type": "object"}})
+    result = await runtime.execute(
+        CodingTask("surrogate-plan", "corr-surrogate", "prompt", "claude", "plan"),
+        tmp_path,
+    )
+    diagnostic = result.output["envelope_diagnostic"]
+    assert diagnostic["reason"] == expected_reason
+    assert result.status == (AgentStatus.SUCCEEDED if expected_reason == "ok"
+                             else AgentStatus.FAILED)
+    if expected_value is None:
+        assert diagnostic["framing"] == "invalid_json"
+        assert result.output["response_source"] == "rejected_envelope"
+        assert result.output["final_text"] is None
+        assert escaped not in json.dumps(result.output)
+    else:
+        assert json.loads(result.output["final_text"]) == {"steps": [expected_value]}
+
+
 @pytest.mark.parametrize("stdout", [
     b'{"structured_output":' + b'{"x":' * 3500 + b'0' + b'}' * 3500 + b'}',
     b'{"structured_output":{"value":' + b'1' * 5000 + b'}}',

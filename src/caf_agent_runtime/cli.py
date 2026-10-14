@@ -209,10 +209,11 @@ def _structured_envelope(data: bytes, schema: dict,
     structured = envelope["structured_output"]
     try:
         candidate = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
-    except (RecursionError, ValueError):
+        candidate_bytes = candidate.encode("utf-8")
+    except (RecursionError, ValueError, UnicodeEncodeError):
         diagnostic["framing"] = "invalid_json"
         return reject("malformed_json")
-    if len(candidate.encode("utf-8")) > _MAX_STRUCTURED_TEXT:
+    if len(candidate_bytes) > _MAX_STRUCTURED_TEXT:
         return reject("oversized_structured_output")
     if _SECRET.search(candidate):
         return reject("sensitive_structured_output")
