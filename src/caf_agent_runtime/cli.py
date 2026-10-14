@@ -116,6 +116,36 @@ def _error_flag_kind(value: dict) -> str:
     return "non_boolean"
 
 
+def _array_fingerprint(items: list) -> dict:
+    """Fixed, bounded shape only; never retain array entries or provider fields."""
+    result_positions = [index for index, item in enumerate(items)
+                        if isinstance(item, dict) and item.get("type") == "result"]
+    if not result_positions:
+        position = "none"
+    elif len(result_positions) > 1:
+        position = "multiple"
+    else:
+        position = "last" if result_positions[0] == len(items) - 1 else "non_last"
+
+    def capped(count: int) -> int:
+        return min(count, 1001)
+
+    return {
+        "array_length_capped": capped(len(items)),
+        "array_non_object_count_capped": capped(sum(not isinstance(item, dict)
+                                                      for item in items)),
+        "array_result_count_capped": capped(len(result_positions)),
+        "array_structured_count_capped": capped(sum(
+            isinstance(item, dict) and "structured_output" in item for item in items)),
+        "array_error_count_capped": capped(sum(
+            isinstance(item, dict) and (item.get("type") == "error"
+                                        or item.get("is_error") is True
+                                        or item.get("status") == "error")
+            for item in items)),
+        "array_result_position": position,
+    }
+
+
 def _structured_envelope(data: bytes, schema: dict,
                          oversized: bool = False) -> tuple[str | None, dict]:
     """Extract one documented JSON result with fixed metadata, never raw fields."""
@@ -126,6 +156,9 @@ def _structured_envelope(data: bytes, schema: dict,
         "result_type": None, "structured_output_type": None,
         "nested_structured_output_type": None,
         "stdout_bytes_capped": min(len(data), _MAX_CAPTURE + 1),
+        "array_length_capped": None, "array_non_object_count_capped": None,
+        "array_result_count_capped": None, "array_structured_count_capped": None,
+        "array_error_count_capped": None, "array_result_position": None,
     }
 
     def reject(reason: str) -> tuple[None, dict]:
@@ -171,6 +204,8 @@ def _structured_envelope(data: bytes, schema: dict,
         diagnostic["framing"] = "invalid_json"
         return reject("malformed_json")
     diagnostic["root_type"] = _json_kind(envelope)
+    if isinstance(envelope, list):
+        diagnostic.update(_array_fingerprint(envelope))
     if not isinstance(envelope, dict):
         return reject("root_type")
     diagnostic["type_tag"] = _tag_kind(envelope, "type", "result")

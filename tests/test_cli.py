@@ -197,7 +197,10 @@ def test_structured_envelope_contract_fixtures(case: dict) -> None:
     assert diagnostic["framing"] == case["framing"]
     for key in ("root_type", "type_tag", "subtype_tag", "status_tag", "is_error",
                 "result_type", "structured_output_type",
-                "nested_structured_output_type"):
+                "nested_structured_output_type", "array_length_capped",
+                "array_non_object_count_capped", "array_result_count_capped",
+                "array_structured_count_capped", "array_error_count_capped",
+                "array_result_position"):
         if key in case:
             assert diagnostic[key] == case[key]
     assert (candidate is not None) == (case["reason"] == "ok")
@@ -213,6 +216,25 @@ def test_structured_envelope_invalid_utf8_and_size_are_fixed_codes() -> None:
     _, unsupported = cli._structured_envelope(
         b'{"structured_output":{"steps":["ok"]}}', {"type": ["object", "null"]})
     assert unsupported["reason"] == "unsupported_schema_root"
+
+
+@pytest.mark.asyncio
+async def test_structured_array_remains_rejected_without_copying_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    raw = b'[{"type":"system","private":"PRIVATE"},{"type":"result",' \
+          b'"structured_output":{"steps":["PRIVATE"]}}]'
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec",
+                        AsyncMock(return_value=FakeProcess(raw)))
+    runtime = ClaudeRuntime(structured_schemas={"plan": {"type": "object"}})
+    result = await runtime.execute(
+        CodingTask("array-plan", "array-corr", "prompt", "claude", "plan"), tmp_path)
+    assert result.status == AgentStatus.FAILED
+    assert result.output["final_text"] is None
+    assert result.output["response_source"] == "rejected_envelope"
+    assert result.output["envelope_diagnostic"]["reason"] == "root_type"
+    assert result.output["envelope_diagnostic"]["array_result_position"] == "last"
+    assert "PRIVATE" not in json.dumps(result.output)
 
 
 @pytest.mark.asyncio
@@ -260,6 +282,9 @@ def test_structured_envelope_pathological_json_has_fixed_reason(stdout: bytes) -
         "reason", "framing", "root_type", "type_tag", "subtype_tag", "status_tag",
         "is_error", "result_type", "structured_output_type",
         "nested_structured_output_type", "stdout_bytes_capped",
+        "array_length_capped", "array_non_object_count_capped",
+        "array_result_count_capped", "array_structured_count_capped",
+        "array_error_count_capped", "array_result_position",
     }
 
 

@@ -143,6 +143,10 @@ Exit-zero envelope rejection is reported as an agent failure. Raw provider
 fields, response content and unknown field names are not retained in this
 diagnostic. See the umbrella
 [envelope diagnostic gate](../../docs/experiments/2026-10-14-envelope-diagnostic-gate.md).
+An unrecognized root array remains rejected. The runtime records only bounded
+shape counts and the position class of a sole tagged result, never an array
+element. The official JSON contract inspected so far does not establish an
+array wrapper for this CLI invocation.
 
 Every CLI child now receives an explicit minimal environment: OS executable
 lookup and user profile/config directory paths, plus `CODEX_HOME` or
